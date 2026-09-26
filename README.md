@@ -145,8 +145,11 @@ several RPCs, since public RPCs are rate limited:
 
 ```bash
 N=300 pnpm load:local                                          # against `pnpm chain`
-N=5000 RPCS=https://rpc-a,https://rpc-b pnpm load:testnet      # costs roughly N x 0.0004 MON
+N=5000 RPCS=https://rpc-a,https://rpc-b pnpm load:testnet
 ```
+
+Each wallet gets `(90k + 140k gas) x current gas price x 1.5`, printed before funding. Check that
+the deployer holds enough MON for N wallets before a large run.
 
 ### 5. Run the frontend and set up registration
 
