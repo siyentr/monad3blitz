@@ -56,6 +56,17 @@ contract CourseRegistration {
     mapping(uint256 => bytes32) public seedAcc;
     mapping(uint256 => address[]) private _pool;
 
+    // Draw state. Each applicant's score is keccak256(seed, student); the `capacity` lowest scores win.
+    // A max-heap of the best scores so far lets the draw run in batches over thousands of applicants.
+    struct Entry {
+        bytes32 score;
+        address student;
+    }
+
+    mapping(uint256 => Entry[]) private _heap;
+    mapping(uint256 => uint256) public drawCursor;
+    mapping(uint256 => bool) public drawn;
+
     // ---------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------
@@ -68,6 +79,7 @@ contract CourseRegistration {
     event ScheduleSet(uint64 applyStart, uint64 applyEnd, uint64 revealEnd);
     event Applied(uint256 indexed courseId, address indexed student, bytes32 commitment);
     event Revealed(uint256 indexed courseId, address indexed student, bytes32 secret);
+    event DrawFinished(uint256 indexed courseId, bytes32 seed, uint32 winners);
 
     // ---------------------------------------------------------------------
     // Errors
@@ -82,6 +94,7 @@ contract CourseRegistration {
     error NotApplied();
     error AlreadyRevealed();
     error WrongSecret();
+    error AlreadyDrawn();
     error InsufficientAKTS(uint256 have, uint256 need);
     error InvalidWindow();
     error InvalidParams();
@@ -105,6 +118,11 @@ contract CourseRegistration {
 
     modifier revealOpen() {
         if (applyStart == 0 || block.timestamp < applyEnd || block.timestamp >= revealEnd) revert WrongPhase();
+        _;
+    }
+
+    modifier drawOpen() {
+        if (applyStart == 0 || block.timestamp < revealEnd) revert WrongPhase();
         _;
     }
 
@@ -229,6 +247,84 @@ contract CourseRegistration {
         _pool[courseId].push(msg.sender);
 
         emit Revealed(courseId, msg.sender, secret);
+    }
+
+    // =====================================================================
+    // Draw (anyone can call it, so the admin cannot stall it)
+    // =====================================================================
+
+    /// @notice Final random seed of a course. Fixed once the reveal window closes.
+    function drawSeed(uint256 courseId) public view returns (bytes32) {
+        return keccak256(abi.encode(seedAcc[courseId], courseId, address(this)));
+    }
+
+    /// @notice Run the draw for up to `maxSteps` applicants. Call repeatedly until `drawn(courseId)`.
+    ///         The winners are the same for any batch size and any reveal order.
+    function draw(uint256 courseId, uint256 maxSteps) external drawOpen validCourse(courseId) {
+        if (drawn[courseId]) revert AlreadyDrawn();
+        if (maxSteps == 0) revert InvalidParams();
+
+        Course storage c = _courses[courseId];
+        address[] storage pool = _pool[courseId];
+        Entry[] storage heap = _heap[courseId];
+        bytes32 seed = drawSeed(courseId);
+        uint256 n = pool.length;
+        uint256 cursor = drawCursor[courseId];
+        uint256 steps;
+
+        // Pass 1: keep the `capacity` lowest scores in the heap
+        for (; cursor < n && steps < maxSteps; steps++) {
+            address student = pool[cursor++];
+            bytes32 score = keccak256(abi.encode(seed, student));
+            if (heap.length < c.capacity) {
+                heap.push(Entry(score, student));
+                _siftUp(heap, heap.length - 1);
+            } else if (score < heap[0].score) {
+                heap[0] = Entry(score, student);
+                _siftDown(heap, 0);
+            }
+        }
+        drawCursor[courseId] = cursor;
+
+        // Pass 2: seat the winners
+        address[] storage roster = _roster[courseId];
+        while (cursor == n && roster.length < heap.length && steps < maxSteps) {
+            address winner = heap[roster.length].student;
+            roster.push(winner);
+            _rosterIndex[courseId][winner] = roster.length;
+            steps++;
+        }
+
+        if (cursor == n && roster.length == heap.length) {
+            drawn[courseId] = true;
+            c.enrolled = uint32(roster.length);
+            emit DrawFinished(courseId, seed, c.enrolled);
+        }
+    }
+
+    function _siftUp(Entry[] storage heap, uint256 i) private {
+        Entry memory e = heap[i];
+        while (i > 0) {
+            uint256 parent = (i - 1) / 2;
+            if (heap[parent].score >= e.score) break;
+            heap[i] = heap[parent];
+            i = parent;
+        }
+        heap[i] = e;
+    }
+
+    function _siftDown(Entry[] storage heap, uint256 i) private {
+        uint256 len = heap.length;
+        Entry memory e = heap[i];
+        while (true) {
+            uint256 child = 2 * i + 1;
+            if (child >= len) break;
+            if (child + 1 < len && heap[child + 1].score > heap[child].score) child++;
+            if (heap[child].score <= e.score) break;
+            heap[i] = heap[child];
+            i = child;
+        }
+        heap[i] = e;
     }
 
     // =====================================================================

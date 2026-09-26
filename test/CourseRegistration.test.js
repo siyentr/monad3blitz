@@ -6,6 +6,21 @@ const secretOf = (label) => ethers.id(`secret-${label}`);
 const commitmentOf = (courseId, student, secret) =>
   ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["uint256", "address", "bytes32"], [courseId, student, secret]));
 
+const coder = ethers.AbiCoder.defaultAbiCoder();
+
+// Off-chain recomputation of the draw: the `capacity` lowest keccak256(seed, student) scores win
+function expectedWinners(contractAddress, courseId, secrets, pool, capacity) {
+  const acc = secrets.map(BigInt).reduce((a, b) => a ^ b, 0n);
+  const seed = ethers.keccak256(
+    coder.encode(["bytes32", "uint256", "address"], [ethers.toBeHex(acc, 32), courseId, contractAddress])
+  );
+  return pool
+    .map((student) => ({ student, score: BigInt(ethers.keccak256(coder.encode(["bytes32", "address"], [seed, student]))) }))
+    .sort((a, b) => (a.score < b.score ? -1 : 1))
+    .slice(0, capacity)
+    .map((e) => e.student);
+}
+
 describe("CourseRegistration", function () {
   async function deployFixture() {
     const [admin, alice, bob, carol, outsider, ...rest] = await ethers.getSigners();
@@ -202,6 +217,102 @@ describe("CourseRegistration", function () {
       for (const s of [carol, alice, bob]) await reveal(reg, s, 0);
       const expected = [alice, bob, carol].map((s) => BigInt(secretOf(s.address))).reduce((a, b) => a ^ b);
       expect(BigInt(await reg.seedAcc(0))).to.equal(expected);
+    });
+  });
+
+  describe("Draw", function () {
+    // 50 students apply for a 10-seat course; 45 reveal
+    async function lotteryFixture() {
+      const signers = (await ethers.getSigners()).slice(1, 51);
+      const reg = await (await ethers.getContractFactory("CourseRegistration")).deploy();
+      await reg.addStudents(signers.map((s) => s.address));
+      await reg.addCourse("CENG999", "Popular Elective", 5, 10);
+      const start = (await time.latest()) + 60;
+      await reg.setSchedule(start, start + 300, start + 600);
+      await time.increaseTo(start);
+
+      // All applications land in the same block: order does not matter any more
+      await ethers.provider.send("evm_setAutomine", [false]);
+      const txs = await Promise.all(
+        signers.map((s) =>
+          reg.connect(s).applyFor(0, commitmentOf(0, s.address, secretOf(s.address)), { gasLimit: 300000 })
+        )
+      );
+      await ethers.provider.send("evm_mine", []);
+      await ethers.provider.send("evm_setAutomine", [true]);
+      for (const t of txs) expect((await ethers.provider.getTransactionReceipt(t.hash)).status).to.equal(1);
+
+      await time.increaseTo(start + 300);
+      const revealers = signers.slice(5).reverse();
+      for (const s of revealers) await reg.connect(s).reveal(0, secretOf(s.address));
+      await time.increaseTo(start + 600);
+
+      const winners = expectedWinners(
+        await reg.getAddress(),
+        0,
+        revealers.map((s) => secretOf(s.address)),
+        revealers.map((s) => s.address),
+        10
+      );
+      return { reg, signers, revealers, winners };
+    }
+
+    async function drawAll(reg, courseId, batch) {
+      while (!(await reg.drawn(courseId))) await reg.draw(courseId, batch);
+    }
+
+    it("is only possible after the reveal window", async function () {
+      const { reg, alice, apply } = await loadFixture(openFixture);
+      await apply(alice, 0);
+      await expect(reg.draw(0, 10)).to.be.revertedWithCustomError(reg, "WrongPhase");
+    });
+
+    it("seats exactly the lowest scores, matching the off-chain recomputation", async function () {
+      const { reg, winners } = await loadFixture(lotteryFixture);
+      await expect(reg.draw(0, 1000)).to.emit(reg, "DrawFinished");
+      const roster = await reg.getRoster(0);
+      expect([...roster].sort()).to.deep.equal([...winners].sort());
+      expect((await reg.getCourse(0)).enrolled).to.equal(10);
+      for (const w of winners) expect(await reg.isEnrolled(0, w)).to.equal(true);
+    });
+
+    it("gives the same winners for any batch size", async function () {
+      for (const batch of [1, 7, 1000]) {
+        const { reg, winners } = await loadFixture(lotteryFixture);
+        await drawAll(reg, 0, batch);
+        expect([...(await reg.getRoster(0))].sort()).to.deep.equal([...winners].sort());
+      }
+    });
+
+    it("excludes applicants who did not reveal", async function () {
+      const { reg, signers } = await loadFixture(lotteryFixture);
+      await reg.draw(0, 1000);
+      for (const s of signers.slice(0, 5)) expect(await reg.isEnrolled(0, s.address)).to.equal(false);
+    });
+
+    it("cannot be run twice", async function () {
+      const { reg } = await loadFixture(lotteryFixture);
+      await reg.draw(0, 1000);
+      await expect(reg.draw(0, 1000)).to.be.revertedWithCustomError(reg, "AlreadyDrawn");
+    });
+
+    it("seats everyone when there are fewer applicants than seats", async function () {
+      const { reg, alice, bob, apply, applyEnd, revealEnd } = await loadFixture(openFixture);
+      await apply(alice, 1);
+      await apply(bob, 1);
+      await time.increaseTo(applyEnd);
+      await reg.connect(alice).reveal(1, secretOf(alice.address));
+      await reg.connect(bob).reveal(1, secretOf(bob.address));
+      await time.increaseTo(revealEnd);
+      await reg.draw(1, 1000);
+      expect([...(await reg.getRoster(1))].sort()).to.deep.equal([alice.address, bob.address].sort());
+    });
+
+    it("finishes immediately when nobody revealed", async function () {
+      const { reg, revealEnd } = await loadFixture(openFixture);
+      await time.increaseTo(revealEnd);
+      await expect(reg.draw(0, 1)).to.emit(reg, "DrawFinished");
+      expect(await reg.getRoster(0)).to.deep.equal([]);
     });
   });
 });
