@@ -72,10 +72,10 @@ function notify(msg, kind = "ok") {
 }
 
 function decodeError(err) {
-  const iface = state.readContract.interface;
+  const iface = state.readContract?.interface;
   if (err?.revert?.name) return ERRORS[err.revert.name] || err.revert.name;
   const data = err?.data || err?.info?.error?.data?.data || err?.info?.error?.data || err?.error?.data;
-  if (typeof data === "string" && data.startsWith("0x")) {
+  if (iface && typeof data === "string" && data.startsWith("0x")) {
     try {
       const parsed = iface.parseError(data);
       if (parsed) return ERRORS[parsed.name] || parsed.name;
@@ -150,34 +150,102 @@ function commitmentOf(courseId, student, secret) {
 
 // ---------------------------------------------------------------- wallet
 
-async function switchChain() {
+// EIP-6963: discover injected wallets so MetaMask is used even when other wallet
+// extensions (Phantom, Coinbase, Rabby, ...) are fighting over window.ethereum.
+const wallets = [];
+window.addEventListener("eip6963:announceProvider", (e) => wallets.push(e.detail));
+window.dispatchEvent(new Event("eip6963:requestProvider"));
+
+function getEthereum() {
+  const mm = wallets.find((w) => w.info.rdns === "io.metamask");
+  return (mm || wallets[0])?.provider || window.ethereum;
+}
+
+async function switchChain(eth) {
   const hex = "0x" + D.chainId.toString(16);
+  if ((await eth.request({ method: "eth_chainId" })) === hex) return;
   try {
-    await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hex }] });
+    await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hex }] });
   } catch (e) {
-    if (e.code === 4902 && NETWORKS[D.chainId]) {
-      await window.ethereum.request({
-        method: "wallet_addEthereumChain",
-        params: [{ chainId: hex, ...NETWORKS[D.chainId] }],
-      });
+    const code = e.code ?? e.data?.originalError?.code;
+    if (code === 4902 && NETWORKS[D.chainId]) {
+      await eth.request({ method: "wallet_addEthereumChain", params: [{ chainId: hex, ...NETWORKS[D.chainId] }] });
     } else throw e;
   }
 }
 
+async function useAccount(eth) {
+  const provider = new ethers.BrowserProvider(eth);
+  const signer = await provider.getSigner();
+  state.account = (await signer.getAddress()).toLowerCase();
+  state.writeContract = new ethers.Contract(D.address, D.abi, signer);
+  $("connectBtn").textContent = `${state.account.slice(0, 6)}…${state.account.slice(-4)}`;
+  await refresh();
+}
+
+function disconnected() {
+  state.account = null;
+  state.writeContract = null;
+  state.balance = null;
+  state.myCourses = new Set();
+  $("connectBtn").textContent = "Connect wallet";
+  render();
+}
+
 async function connect() {
-  if (!window.ethereum) return notify("No wallet found. Install MetaMask or another EVM wallet.", "err");
-  try {
-    await window.ethereum.request({ method: "eth_requestAccounts" });
-    await switchChain();
-    const provider = new ethers.BrowserProvider(window.ethereum);
-    const signer = await provider.getSigner();
-    state.account = (await signer.getAddress()).toLowerCase();
-    state.writeContract = new ethers.Contract(D.address, D.abi, signer);
-    $("connectBtn").textContent = `${state.account.slice(0, 6)}…${state.account.slice(-4)}`;
-    await refresh();
-  } catch (e) {
-    notify(decodeError(e), "err");
+  if (location.protocol === "file:") {
+    return notify("Wallets can't connect to a file:// page. Run `pnpm web` and open http://localhost:5173", "err");
   }
+  if (!D) return notify("No deployment found. Run `pnpm deploy:testnet` first.", "err");
+  const eth = getEthereum();
+  if (!eth) return notify("No wallet found. Install MetaMask (or another EVM wallet) and reload.", "err");
+
+  const btn = $("connectBtn");
+  btn.disabled = true;
+  btn.textContent = "Connecting…";
+  notify("Approve the connection in MetaMask. If no popup appears, click the MetaMask icon in your toolbar.", "pending");
+  try {
+    await eth.request({ method: "eth_requestAccounts" });
+    notify(`Switch MetaMask to ${NETWORKS[D.chainId]?.chainName || "chain " + D.chainId}…`, "pending");
+    await switchChain(eth);
+    await useAccount(eth);
+    notify("Wallet connected ✓", "ok");
+  } catch (e) {
+    console.error("connect failed", e);
+    const code = e.code ?? e.error?.code;
+    if (code === -32002) notify("MetaMask already has a request waiting. Click the MetaMask icon in your toolbar to approve it.", "err");
+    else if (code === 4001 || e.code === "ACTION_REJECTED") notify("Connection rejected in MetaMask.", "err");
+    else notify(`Could not connect: ${decodeError(e)}`, "err");
+    if (!state.account) btn.textContent = "Connect wallet";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Reconnect silently (no popup) if this site is already authorized in the wallet
+async function autoConnect() {
+  const eth = getEthereum();
+  if (!eth || !D) return;
+  try {
+    const accounts = await eth.request({ method: "eth_accounts" });
+    const chainId = await eth.request({ method: "eth_chainId" });
+    if (accounts.length && Number(chainId) === D.chainId) await useAccount(eth);
+  } catch (e) {
+    console.error("autoConnect failed", e);
+  }
+}
+
+function watchWallet() {
+  const eth = getEthereum();
+  if (!eth?.on) return;
+  eth.on("accountsChanged", (accs) => (accs.length ? autoConnect() : disconnected()));
+  eth.on("chainChanged", async (chainId) => {
+    if (Number(chainId) === D.chainId) return autoConnect();
+    if (state.account) {
+      disconnected();
+      notify("Wrong network in MetaMask. Click Connect wallet to switch back.", "err");
+    }
+  });
 }
 
 // ---------------------------------------------------------------- data
@@ -308,7 +376,11 @@ function renderCourses() {
 
 function renderMine() {
   const box = $("myCourses");
-  if (!state.account) return;
+  if (!state.account) {
+    box.innerHTML = `<p class="empty">Connect your wallet to see your enrollments.</p>`;
+    $("myTotal").textContent = "";
+    return;
+  }
   if (!state.isStudent) {
     box.innerHTML = `<p class="empty">This wallet is not on the student list.</p>`;
     $("myTotal").textContent = "";
@@ -444,11 +516,6 @@ $("exportBtn").addEventListener("click", async () => {
 
 $("connectBtn").addEventListener("click", connect);
 
-if (window.ethereum) {
-  window.ethereum.on?.("accountsChanged", () => state.account && connect());
-  window.ethereum.on?.("chainChanged", () => location.reload());
-}
-
 // ---------------------------------------------------------------- boot
 
 (async function boot() {
@@ -465,8 +532,14 @@ if (window.ethereum) {
   try {
     await refresh();
   } catch (e) {
+    console.error(e);
     notify(`Could not read the contract: ${decodeError(e)}`, "err");
   }
+  // give EIP-6963 wallets a moment to announce themselves
+  setTimeout(() => {
+    watchWallet();
+    autoConnect();
+  }, 300);
   setInterval(tick, 250);
   setInterval(() => refresh().catch(() => {}), 1000);
 })();
