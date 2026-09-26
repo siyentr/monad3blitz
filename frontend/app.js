@@ -43,8 +43,18 @@ const ERRORS = {
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
+// Multicall3 (same address on most EVM chains). The public Monad RPC allows ~15 requests/sec and
+// counts every call in a JSON-RPC batch, so a refresh is sent as one aggregated call instead.
+const MULTICALL = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const MULTICALL_ABI = [
+  "function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[])",
+];
+const POLL_MS = 2000;
+
 const state = {
   readContract: null,
+  multicall: null, // null when the chain has no Multicall3 (e.g. local Hardhat)
+  tab: "admin", // which page an admin who is also a student is looking at
   writeContract: null,
   account: null,
   admin: null,
@@ -56,6 +66,7 @@ const state = {
   myCourses: new Set(),
   my: {}, // courseId -> { applied, revealed, refunded }
   balance: null,
+  isStudent: false,
   pending: new Set(), // course ids with an in-flight tx
 };
 
@@ -179,7 +190,9 @@ async function useAccount(eth) {
   const signer = await provider.getSigner();
   state.account = (await signer.getAddress()).toLowerCase();
   state.writeContract = new ethers.Contract(D.address, D.abi, signer);
-  $("connectBtn").textContent = `${state.account.slice(0, 6)}…${state.account.slice(-4)}`;
+  state.tab = "admin";
+  $("accountAddr").textContent = `${state.account.slice(0, 6)}…${state.account.slice(-4)}`;
+  $("deniedAddr").textContent = state.account;
   await refresh();
 }
 
@@ -187,6 +200,7 @@ function disconnected() {
   state.account = null;
   state.writeContract = null;
   state.balance = null;
+  state.isStudent = false;
   state.myCourses = new Set();
   state.my = {};
   $("connectBtn").textContent = "Connect wallet";
@@ -251,18 +265,42 @@ function watchWallet() {
 
 // ---------------------------------------------------------------- data
 
-async function refresh() {
+// Run several view calls on the registration contract, as [fnName, ...args], in one RPC request
+async function readMany(calls) {
   const c = state.readContract;
-  const [admin, applyStart, applyEnd, revealEnd, phase, courses, studentCount] = await Promise.all([
-    c.admin(),
-    c.applyStart(),
-    c.applyEnd(),
-    c.revealEnd(),
-    c.phase(),
-    c.getAllCourses(),
-    c.studentCount(),
+  if (!state.multicall) return Promise.all(calls.map(([fn, ...args]) => c[fn](...args)));
+  const iface = c.interface;
+  const res = await state.multicall.aggregate3.staticCall(
+    calls.map(([fn, ...args]) => ({ target: D.address, allowFailure: false, callData: iface.encodeFunctionData(fn, args) }))
+  );
+  return res.map(([, data], i) => {
+    const out = iface.decodeFunctionResult(calls[i][0], data);
+    return out.length === 1 ? out[0] : out;
+  });
+}
+
+async function refresh() {
+  const [admin, applyStart, applyEnd, revealEnd, phase, courses, studentCount] = await readMany([
+    ["admin"],
+    ["applyStart"],
+    ["applyEnd"],
+    ["revealEnd"],
+    ["phase"],
+    ["getAllCourses"],
+    ["studentCount"],
   ]);
-  const drawn = await Promise.all(courses.map((_, id) => c.drawn(id)));
+  const me = state.account;
+  const perCourse = Array.from(courses).flatMap((_, id) =>
+    me ? [["drawn", id], ["commitments", id, me], ["revealed", id, me], ["refunded", id, me]] : [["drawn", id]]
+  );
+  const accountCalls = me ? [["balanceOf", me], ["getStudentCourses", me], ["isStudent", me]] : [];
+  const rest = await readMany([...accountCalls, ...perCourse]);
+  const acct = rest.slice(0, accountCalls.length);
+  const stride = me ? 4 : 1;
+  const rows = courses.map((_, id) => rest.slice(accountCalls.length + id * stride, accountCalls.length + (id + 1) * stride));
+  const drawn = rows.map((r) => r[0]);
+  // The wallet changed while this refresh was in flight; its results belong to the old account
+  if (me !== state.account) return;
   state.admin = admin.toLowerCase();
   state.applyStart = Number(applyStart);
   state.applyEnd = Number(applyEnd);
@@ -280,21 +318,13 @@ async function refresh() {
   }));
   $("studentCount").textContent = studentCount.toString();
 
-  if (state.account) {
-    const [bal, mine, isStudent] = await Promise.all([
-      c.balanceOf(state.account),
-      c.getStudentCourses(state.account),
-      c.isStudent(state.account),
-    ]);
+  if (me) {
+    const [bal, mine, isStudent] = acct;
     state.balance = Number(bal);
     state.isStudent = isStudent;
     state.myCourses = new Set(mine.map(Number));
-    const me = state.account;
-    const rows = await Promise.all(
-      state.courses.map((x) => Promise.all([c.commitments(x.id, me), c.revealed(x.id, me), c.refunded(x.id, me)]))
-    );
     state.my = Object.fromEntries(
-      rows.map(([commitment, revealed, refunded], id) => [id, { applied: commitment !== ethers.ZeroHash, revealed, refunded }])
+      rows.map(([, commitment, revealed, refunded], id) => [id, { applied: commitment !== ethers.ZeroHash, revealed, refunded }])
     );
   }
   render();
@@ -302,7 +332,21 @@ async function refresh() {
 
 // ---------------------------------------------------------------- render
 
+// Which page to show: login, denied (not a student), student or admin
+function currentView() {
+  if (!state.account) return "login";
+  const isAdmin = state.account === state.admin;
+  if (isAdmin && (!state.isStudent || state.tab === "admin")) return "admin";
+  return state.isStudent ? "student" : "denied";
+}
+
 function render() {
+  const view = currentView();
+  document.body.dataset.view = view;
+  const both = state.account && state.account === state.admin && state.isStudent;
+  $("tabs").classList.toggle("hidden", !both);
+  document.querySelectorAll("#tabs .tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === view));
+
   const badge = $("phaseBadge");
   badge.textContent = ["Setup", "Apply", "Reveal", "Draw"][state.phase];
   badge.className = `badge ${["setup", "open", "open", "closed"][state.phase]}`;
@@ -312,8 +356,6 @@ function render() {
   renderCourses();
   renderMine();
 
-  const isAdmin = state.account && state.account === state.admin;
-  $("adminCard").classList.toggle("hidden", !isAdmin);
   $("adminLock").textContent = state.phase === 0 ? "setup is open" : "🔒 locked: applications have opened";
   document.querySelectorAll("#adminCard form button").forEach((b) => (b.disabled = state.phase !== 0));
 }
@@ -322,7 +364,7 @@ function render() {
 function courseAction(c) {
   const my = state.my[c.id] || {};
   const busy = state.pending.has(c.id);
-  const student = state.account && state.isStudent;
+  const student = currentView() === "student";
   const btn = (kind, action, label, dis = false) =>
     `<button class="btn ${kind}" data-action="${action}" data-id="${c.id}" ${dis || busy ? "disabled" : ""}>${busy ? "…" : label}</button>`;
   const done = (label) => `<span class="hint">${label}</span>`;
@@ -334,11 +376,12 @@ function courseAction(c) {
     return btn("primary", "apply", noAkts ? "No AKTS" : "Apply", noAkts);
   }
   if (state.phase === 2) {
-    if (!my.applied) return "";
+    if (!student || !my.applied) return "";
     return my.revealed ? done("Revealed ✓") : btn("primary", "reveal", "Reveal");
   }
   if (state.phase === 3) {
-    if (!c.drawn) return state.account ? btn("", "draw", "Run draw") : done("Waiting for draw");
+    if (!c.drawn) return btn("", "draw", "Run draw");
+    if (!student) return "";
     if (state.myCourses.has(c.id)) return done("Seat won ✓");
     if (my.revealed && !my.refunded) return btn("", "refund", "Claim refund");
     if (my.applied && !my.revealed) return done("Not revealed");
@@ -517,12 +560,44 @@ $("exportBtn").addEventListener("click", async () => {
 
 $("connectBtn").addEventListener("click", connect);
 
+$("tabs").addEventListener("click", (e) => {
+  const t = e.target.closest(".tab");
+  if (!t) return;
+  state.tab = t.dataset.tab;
+  render();
+});
+
+async function logout() {
+  // Drop the site's wallet permission too, otherwise autoConnect logs straight back in on reload
+  try {
+    await getEthereum()?.request({ method: "wallet_revokePermissions", params: [{ eth_accounts: {} }] });
+  } catch {}
+  disconnected();
+}
+
+$("logoutBtn").addEventListener("click", logout);
+
+// Let MetaMask show its account picker again, then re-check the chosen wallet
+$("switchBtn").addEventListener("click", async () => {
+  const eth = getEthereum();
+  try {
+    await eth.request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] });
+    await useAccount(eth);
+  } catch (e) {
+    if (e.code !== 4001) notify(`Could not switch wallet: ${decodeError(e)}`, "err");
+  }
+});
+
 // ---------------------------------------------------------------- boot
 
 (async function boot() {
   if (!D) return;
   const rpc = NETWORKS[D.chainId]?.rpcUrls[0];
-  state.readContract = new ethers.Contract(D.address, D.abi, new ethers.JsonRpcProvider(rpc, D.chainId, { staticNetwork: true }));
+  const provider = new ethers.JsonRpcProvider(rpc, D.chainId, { staticNetwork: true });
+  state.readContract = new ethers.Contract(D.address, D.abi, provider);
+  try {
+    if ((await provider.getCode(MULTICALL)) !== "0x") state.multicall = new ethers.Contract(MULTICALL, MULTICALL_ABI, provider);
+  } catch {}
   $("contractInfo").textContent = `Contract ${D.address} · ${NETWORKS[D.chainId]?.chainName || D.network} (chain ${D.chainId})`;
 
   const now = new Date();
@@ -542,5 +617,12 @@ $("connectBtn").addEventListener("click", connect);
     autoConnect();
   }, 300);
   setInterval(tick, 250);
-  setInterval(() => refresh().catch(() => {}), 1000);
+  // Poll only while logged in, and never start a poll while the previous one is still running
+  let polling = false;
+  setInterval(async () => {
+    if (polling || !state.account) return;
+    polling = true;
+    await refresh().catch(() => {});
+    polling = false;
+  }, POLL_MS);
 })();

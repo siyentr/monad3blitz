@@ -4,11 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AKTS Course Registration</title>
-  <link rel="stylesheet" href="style.css?v=3" />
+  <link rel="stylesheet" href="style.css?v=4" />
   <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
-  <script src="deployment.js?v=3"></script>
+  <script src="deployment.js?v=4"></script>
 </head>
-<body>
+<body data-view="login">
   <header>
     <div class="brand">
       <span class="logo">◆</span>
@@ -17,11 +17,37 @@
         <p class="sub">No race: fair course selection by verifiable lottery on Monad</p>
       </div>
     </div>
-    <button id="connectBtn" class="btn primary">Connect wallet</button>
+    <div class="account" data-show="student admin denied">
+      <nav class="tabs hidden" id="tabs">
+        <button class="tab" data-tab="student" type="button">Student</button>
+        <button class="tab" data-tab="admin" type="button">Admin</button>
+      </nav>
+      <span id="accountAddr" class="mono"></span>
+      <button id="logoutBtn" class="btn" type="button">Log out</button>
+    </div>
   </header>
 
   <main>
-    <section class="status-bar">
+    <div id="notice" class="notice hidden"></div>
+
+    <section class="gate card" data-show="login">
+      <span class="logo big-logo">◆</span>
+      <h2>Log in</h2>
+      <p class="hint">Connect the wallet your university registered. Only students on the list, and the registrar, can enter.</p>
+      <button id="connectBtn" class="btn primary" type="button">Connect wallet</button>
+    </section>
+
+    <section class="gate card" data-show="denied">
+      <span class="logo big-logo denied">✕</span>
+      <h2>Access denied</h2>
+      <p class="hint">The wallet <span id="deniedAddr" class="mono"></span> is not on the student list for this registration.</p>
+      <p class="hint">If you think this is a mistake, contact the registrar. If you have another wallet, switch to it.</p>
+      <div class="row center">
+        <button id="switchBtn" class="btn primary" type="button">Use another wallet</button>
+      </div>
+    </section>
+
+    <section class="status-bar" data-show="student admin">
       <div class="stat">
         <span class="label">Phase</span>
         <span id="phaseBadge" class="badge">—</span>
@@ -34,28 +60,26 @@
         <span class="label">Students</span>
         <span id="studentCount" class="mono big">—</span>
       </div>
-      <div class="stat">
+      <div class="stat" data-show="student">
         <span class="label">Your AKTS</span>
         <span id="myAkts" class="mono big">—</span>
       </div>
     </section>
 
-    <div id="notice" class="notice hidden"></div>
-
-    <section class="card">
+    <section class="card" data-show="student admin">
       <div class="card-head">
         <h2>Courses</h2>
-        <span class="hint" id="liveHint">live · refreshes every second</span>
+        <span class="hint" id="liveHint">live</span>
       </div>
       <div id="courseList" class="course-list"><p class="empty">No deployment loaded. Run the deploy script first.</p></div>
     </section>
 
-    <section class="card" id="myCoursesCard">
+    <section class="card" id="myCoursesCard" data-show="student">
       <div class="card-head"><h2>My courses</h2><span class="hint" id="myTotal"></span></div>
       <div id="myCourses"><p class="empty">Connect your wallet to see your seats.</p></div>
     </section>
 
-    <section class="card hidden" id="adminCard">
+    <section class="card" id="adminCard" data-show="admin">
       <div class="card-head"><h2>Admin</h2><span class="hint" id="adminLock"></span></div>
 
       <div class="admin-grid">
@@ -100,6 +124,6 @@
     <span class="hint">Verify any draw yourself: <code>pnpm verify:draw &lt;contract&gt; &lt;courseId&gt;</code></span>
   </footer>
 
-  <script src="app.js?v=3"></script>
+  <script src="app.js?v=4"></script>
 </body>
 </html>
