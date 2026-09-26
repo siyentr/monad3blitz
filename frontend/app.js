@@ -99,7 +99,12 @@ function decodeError(err) {
 async function send(label, fn) {
   try {
     notify(`${label}: confirm in your wallet…`, "pending");
-    const tx = await fn();
+    // Wallet popups often open behind the browser (Firefox) or wait for the extension to be opened
+    const nudge = setTimeout(
+      () => notify(`${label}: still waiting for your wallet. If no popup appeared, click the MetaMask icon in your toolbar.`, "pending"),
+      8000
+    );
+    const tx = await fn().finally(() => clearTimeout(nudge));
     notify(`${label}: submitted, waiting for Monad…`, "pending");
     const t0 = performance.now();
     await tx.wait();
