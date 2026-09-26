@@ -30,6 +30,9 @@ const ERRORS = {
   CourseFull: "Too late: the course is full.",
   AlreadyEnrolled: "You are already enrolled in this course.",
   NotEnrolled: "You are not enrolled in this course.",
+  CourseNotFull: "The course has free seats, so enroll directly instead of joining the waitlist.",
+  AlreadyWaitlisted: "You are already on this course's waitlist.",
+  NotWaitlisted: "You are not on this course's waitlist.",
   InsufficientAKTS: "Not enough AKTS left for this course.",
   InvalidWindow: "Invalid window: it must start in the future and end after it starts.",
   InvalidParams: "Invalid input.",
@@ -59,6 +62,7 @@ const state = {
   phase: 0,
   courses: [],
   myCourses: new Set(),
+  myWaitlists: new Map(), // course id => 1-based place in line
   students: [], // full student list, loaded only for the admin
   balance: null,
   isStudent: false,
@@ -197,6 +201,7 @@ function disconnected() {
   state.balance = null;
   state.isStudent = false;
   state.myCourses = new Set();
+  state.myWaitlists = new Map();
   $("connectBtn").textContent = "Connect wallet";
   render();
 }
@@ -275,7 +280,9 @@ async function readMany(calls) {
 
 async function refresh() {
   const me = state.account;
-  const accountCalls = me ? [["balanceOf", me], ["getStudentCourses", me], ["isStudent", me]] : [];
+  const accountCalls = me
+    ? [["balanceOf", me], ["getStudentCourses", me], ["isStudent", me], ["getStudentWaitlists", me]]
+    : [];
   // Only the admin page shows the student list, so skip the (possibly large) read for everyone else
   const adminCalls = me && me === state.admin ? [["getStudents"]] : [];
   const [admin, start, end, phase, courses, studentCount, ...rest] = await readMany([
@@ -303,14 +310,21 @@ async function refresh() {
     akts: Number(x.akts),
     capacity: Number(x.capacity),
     enrolled: Number(x.enrolled),
+    waitlisted: Number(x.waitlisted),
   }));
   $("studentCount").textContent = studentCount.toString();
 
   if (me) {
-    const [bal, mine, isStudent] = acct;
+    const [bal, mine, isStudent, [wlIds, wlPositions]] = acct;
+    const myCourses = new Set(mine.map(Number));
+    // A course moved from our waitlists to our courses: someone dropped and we got the seat
+    for (const id of state.myWaitlists.keys()) {
+      if (myCourses.has(id)) notify(`You got a seat in ${state.courses[id].code} from the waitlist ✓`, "ok");
+    }
     state.balance = Number(bal);
     state.isStudent = isStudent;
-    state.myCourses = new Set(mine.map(Number));
+    state.myCourses = myCourses;
+    state.myWaitlists = new Map(wlIds.map((id, i) => [Number(id), Number(wlPositions[i])]));
   }
   state.students = adminCalls.length ? [...rest[accountCalls.length]] : [];
   // Admin just logged in: the list was not requested yet, so fetch it right away
@@ -361,25 +375,31 @@ function renderCourses() {
       const pct = Math.round((c.enrolled / c.capacity) * 100);
       const full = c.enrolled >= c.capacity;
       const mine = state.myCourses.has(c.id);
+      const place = state.myWaitlists.get(c.id);
       const busy = state.pending.has(c.id);
       let btn = "";
       if (currentView() !== "student") {
         // Admin page: no enroll buttons
       } else if (mine) {
         btn = `<button class="btn danger" data-drop="${c.id}" ${!canAct || busy ? "disabled" : ""}>${busy ? "…" : "Drop"}</button>`;
+      } else if (place) {
+        btn = `<button class="btn danger" data-leave="${c.id}" ${!canAct || busy ? "disabled" : ""}>${busy ? "…" : "Leave waitlist"}</button>`;
       } else {
         const noAkts = state.balance !== null && state.balance < c.akts;
-        const dis = !canAct || full || noAkts || busy;
-        const label = busy ? "…" : full ? "Full" : noAkts ? "No AKTS" : "Enroll";
-        btn = `<button class="btn primary" data-enroll="${c.id}" ${dis ? "disabled" : ""}>${label}</button>`;
+        const dis = !canAct || noAkts || busy;
+        const label = busy ? "…" : noAkts ? "No AKTS" : full ? "Join waitlist" : "Enroll";
+        btn = full
+          ? `<button class="btn" data-join="${c.id}" ${dis ? "disabled" : ""}>${label}</button>`
+          : `<button class="btn primary" data-enroll="${c.id}" ${dis ? "disabled" : ""}>${label}</button>`;
       }
+      const waiting = place ? ` · #${place} of ${c.waitlisted} in line` : c.waitlisted ? ` · ${c.waitlisted} in line` : "";
       return `
-        <div class="course ${mine ? "mine" : ""}">
+        <div class="course ${mine ? "mine" : place ? "waiting" : ""}">
           <span class="code">${esc(c.code)}</span>
           <span class="title">${esc(c.title)}</span>
           <span class="akts mono">${c.akts} AKTS</span>
           <div class="seats">
-            <span class="mono">${c.enrolled} / ${c.capacity} seats</span>
+            <span class="mono">${c.enrolled} / ${c.capacity} seats${waiting}</span>
             <div class="bar ${full ? "full" : pct >= 75 ? "warn" : ""}"><span style="width:${pct}%"></span></div>
           </div>
           <span class="action">${btn}</span>
@@ -414,11 +434,17 @@ function renderMine() {
     return;
   }
   const mine = state.courses.filter((c) => state.myCourses.has(c.id));
+  const waiting = state.courses.filter((c) => state.myWaitlists.has(c.id));
   const total = mine.reduce((a, c) => a + c.akts, 0);
-  $("myTotal").textContent = `${total} AKTS used · ${state.balance} left`;
-  box.innerHTML = mine.length
-    ? `<ul>${mine.map((c) => `<li><b>${esc(c.code)}</b> ${esc(c.title)} <span class="hint">(${c.akts} AKTS)</span></li>`).join("")}</ul>`
-    : `<p class="empty">No courses selected yet.</p>`;
+  const held = waiting.reduce((a, c) => a + c.akts, 0);
+  $("myTotal").textContent = `${total} AKTS used · ${held ? `${held} held for waitlists · ` : ""}${state.balance} left`;
+  const item = (c, note) => `<li><b>${esc(c.code)}</b> ${esc(c.title)} <span class="hint">(${note})</span></li>`;
+  box.innerHTML =
+    (mine.length ? `<ul>${mine.map((c) => item(c, `${c.akts} AKTS`)).join("")}</ul>` : `<p class="empty">No courses selected yet.</p>`) +
+    (waiting.length
+      ? `<h3>Waitlists</h3><p class="hint">You get the seat automatically when someone drops. The AKTS are held until then, and refunded if you leave.</p>` +
+        `<ul>${waiting.map((c) => item(c, `#${state.myWaitlists.get(c.id)} in line · ${c.akts} AKTS held`)).join("")}</ul>`
+      : "");
 }
 
 function tick() {
@@ -459,6 +485,12 @@ $("courseList").addEventListener("click", (e) => {
   } else if (b.dataset.drop !== undefined) {
     const id = Number(b.dataset.drop);
     withPending(id, () => send(`Drop ${state.courses[id].code}`, () => write("drop", id)));
+  } else if (b.dataset.join !== undefined) {
+    const id = Number(b.dataset.join);
+    withPending(id, () => send(`Join ${state.courses[id].code} waitlist`, () => write("joinWaitlist", id)));
+  } else if (b.dataset.leave !== undefined) {
+    const id = Number(b.dataset.leave);
+    withPending(id, () => send(`Leave ${state.courses[id].code} waitlist`, () => write("leaveWaitlist", id)));
   }
 });
 

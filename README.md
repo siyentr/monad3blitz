@@ -13,9 +13,12 @@ moves registration onto Monad so the rules are public and identical for everyone
 2. **Every student gets 30 AKTS**: a soulbound token. It cannot be transferred, sold or approved.
 3. **Registration opens**: students enroll first come, first served. Enrolling spends the course's
    AKTS; dropping refunds them and frees the seat for the next student.
-4. **Admin is locked out**: once the window opens, the admin can't add students, change
+4. **Waitlists**: when a course is full, students can join its waitlist. Joining holds the course's
+   AKTS; leaving refunds them. When an enrolled student drops, the first student in line gets the
+   seat automatically, in the same transaction.
+5. **Admin is locked out**: once the window opens, the admin can't add students, change
    capacities or move the window. No backdoors, no favourites.
-5. **Registration closes**: the admin exports the final rosters as CSV.
+6. **Registration closes**: the admin exports the final rosters as CSV.
 
 ### Why Monad
 
@@ -32,6 +35,7 @@ checked against the same contract rules, and students see the seat counts update
 | Course capacity | `CourseFull` |
 | Max 30 AKTS per student | `InsufficientAKTS` |
 | No double enrollment | `AlreadyEnrolled` |
+| Waitlist only for full courses, once per student | `CourseNotFull`, `AlreadyWaitlisted` |
 | Admin can't change anything after start | `SetupLocked` |
 | AKTS can't be transferred | `Soulbound` |
 
@@ -39,7 +43,7 @@ checked against the same contract rules, and students see the seat counts update
 
 ```bash
 pnpm install
-pnpm test                # 18 tests, including a 50-student rush on a 10-seat course
+pnpm test                # 24 tests, including a 50-student rush on a 10-seat course
 
 pnpm chain               # terminal 1: local chain
 pnpm deploy:local        # terminal 2: deploys + writes frontend/deployment.js
