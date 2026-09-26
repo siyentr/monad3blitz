@@ -4,9 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AKTS Course Registration</title>
-  <link rel="stylesheet" href="style.css?v=7" />
+  <link rel="stylesheet" href="style.css?v=8" />
   <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
-  <script src="deployment.js?v=7"></script>
+  <script src="deployment.js?v=8"></script>
 </head>
 <body data-view="login">
   <header>
@@ -88,6 +88,11 @@
           <p class="hint">One wallet address per line (or comma separated). Each gets 30 AKTS.</p>
           <textarea id="studentsInput" rows="6" placeholder="0x...&#10;0x..."></textarea>
           <button class="btn primary" type="submit">Add students</button>
+          <div class="card-head">
+            <h3>Students</h3>
+            <span class="hint" id="studentListHint"></span>
+          </div>
+          <ul id="studentList" class="student-list"></ul>
         </form>
 
         <form id="courseForm" class="panel">
@@ -122,6 +127,6 @@
     <span id="contractInfo"></span>
   </footer>
 
-  <script src="app.js?v=7"></script>
+  <script src="app.js?v=8"></script>
 </body>
 </html>

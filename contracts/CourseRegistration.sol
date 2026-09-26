@@ -38,6 +38,10 @@ contract CourseRegistration {
     mapping(address => bool) public isStudent;
     uint256 public studentCount;
 
+    // Student list for the admin panel, plus 1-based index for O(1) removal
+    address[] private _students;
+    mapping(address => uint256) private _studentIndex;
+
     // courseId => roster, plus 1-based index for O(1) removal (0 = not enrolled)
     mapping(uint256 => address[]) private _roster;
     mapping(uint256 => mapping(address => uint256)) private _rosterIndex;
@@ -117,6 +121,8 @@ contract CourseRegistration {
             if (s == address(0)) revert InvalidParams();
             if (isStudent[s]) revert AlreadyStudent(s);
             isStudent[s] = true;
+            _students.push(s);
+            _studentIndex[s] = _students.length;
             balanceOf[s] = AKTS_PER_STUDENT;
             totalSupply += AKTS_PER_STUDENT;
             emit StudentAdded(s);
@@ -131,6 +137,14 @@ contract CourseRegistration {
         if (!isStudent[student]) revert NotStudent();
         uint256 bal = balanceOf[student];
         isStudent[student] = false;
+
+        // swap-and-pop removal from the student list
+        uint256 idx = _studentIndex[student];
+        address last = _students[_students.length - 1];
+        _students[idx - 1] = last;
+        _studentIndex[last] = idx;
+        _students.pop();
+        delete _studentIndex[student];
         balanceOf[student] = 0;
         totalSupply -= bal;
         studentCount -= 1;
@@ -251,6 +265,10 @@ contract CourseRegistration {
 
     function getAllCourses() external view returns (Course[] memory) {
         return _courses;
+    }
+
+    function getStudents() external view returns (address[] memory) {
+        return _students;
     }
 
     function getRoster(uint256 courseId) external view validCourse(courseId) returns (address[] memory) {

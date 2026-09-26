@@ -56,6 +56,17 @@ describe("CourseRegistration", function () {
       await expect(reg.addCourse("X", "X", 5, 0)).to.be.revertedWithCustomError(reg, "InvalidParams");
     });
 
+    it("lists students and keeps the list in sync on removal", async function () {
+      const { reg, alice, bob, carol } = await loadFixture(deployFixture);
+      expect(await reg.getStudents()).to.deep.equal([alice.address, bob.address, carol.address]);
+      await reg.removeStudent(alice.address);
+      expect([...(await reg.getStudents())].sort()).to.deep.equal([bob.address, carol.address].sort());
+      await reg.removeStudent(carol.address);
+      expect(await reg.getStudents()).to.deep.equal([bob.address]);
+      await reg.addStudents([alice.address]);
+      expect([...(await reg.getStudents())].sort()).to.deep.equal([alice.address, bob.address].sort());
+    });
+
     it("can remove a student before registration opens", async function () {
       const { reg, carol } = await loadFixture(deployFixture);
       await reg.removeStudent(carol.address);

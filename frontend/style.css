@@ -134,7 +134,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; display: grid
 .notice.err { border-color: var(--err); }
 .notice.pending { border-color: var(--warn); }
 
-.admin-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+.admin-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; align-items: start; }
 .panel {
   background: var(--surface-2);
   border-radius: 10px;
@@ -143,6 +143,10 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; display: grid
   flex-direction: column;
   gap: 10px;
 }
+.panel .card-head { margin: 6px 0 0; }
+.student-list { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow-y: auto; display: grid; gap: 4px; }
+.student-list li { display: flex; align-items: center; gap: 8px; font-size: 12px; word-break: break-all; }
+.student-list .btn { padding: 0 8px; min-width: 28px; line-height: 24px; flex-shrink: 0; }
 .panel label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); flex: 1; }
 .row { display: flex; gap: 10px; }
 input, textarea {

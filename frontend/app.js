@@ -59,6 +59,7 @@ const state = {
   phase: 0,
   courses: [],
   myCourses: new Set(),
+  students: [], // full student list, loaded only for the admin
   balance: null,
   isStudent: false,
   pending: new Set(), // course ids with an in-flight tx
@@ -275,7 +276,9 @@ async function readMany(calls) {
 async function refresh() {
   const me = state.account;
   const accountCalls = me ? [["balanceOf", me], ["getStudentCourses", me], ["isStudent", me]] : [];
-  const [admin, start, end, phase, courses, studentCount, ...acct] = await readMany([
+  // Only the admin page shows the student list, so skip the (possibly large) read for everyone else
+  const adminCalls = me && me === state.admin ? [["getStudents"]] : [];
+  const [admin, start, end, phase, courses, studentCount, ...rest] = await readMany([
     ["admin"],
     ["registrationStart"],
     ["registrationEnd"],
@@ -283,7 +286,10 @@ async function refresh() {
     ["getAllCourses"],
     ["studentCount"],
     ...accountCalls,
+    ...adminCalls,
   ]);
+  const acct = rest.slice(0, accountCalls.length);
+  const firstAdminLoad = me && admin.toLowerCase() === me && !adminCalls.length;
   // The wallet changed while this refresh was in flight; its results belong to the old account
   if (me !== state.account) return;
   state.admin = admin.toLowerCase();
@@ -306,6 +312,9 @@ async function refresh() {
     state.isStudent = isStudent;
     state.myCourses = new Set(mine.map(Number));
   }
+  state.students = adminCalls.length ? [...rest[accountCalls.length]] : [];
+  // Admin just logged in: the list was not requested yet, so fetch it right away
+  if (firstAdminLoad) return refresh();
   render();
 }
 
@@ -334,6 +343,7 @@ function render() {
 
   renderCourses();
   renderMine();
+  renderStudents();
 
   $("adminLock").textContent = state.phase === 0 ? "setup is open" : "🔒 locked: registration has started";
   document.querySelectorAll("#adminCard form button").forEach((b) => (b.disabled = state.phase !== 0));
@@ -352,8 +362,10 @@ function renderCourses() {
       const full = c.enrolled >= c.capacity;
       const mine = state.myCourses.has(c.id);
       const busy = state.pending.has(c.id);
-      let btn;
-      if (mine) {
+      let btn = "";
+      if (currentView() !== "student") {
+        // Admin page: no enroll buttons
+      } else if (mine) {
         btn = `<button class="btn danger" data-drop="${c.id}" ${!canAct || busy ? "disabled" : ""}>${busy ? "…" : "Drop"}</button>`;
       } else {
         const noAkts = state.balance !== null && state.balance < c.akts;
@@ -374,6 +386,19 @@ function renderCourses() {
         </div>`;
     })
     .join("");
+}
+
+function renderStudents() {
+  const locked = state.phase !== 0;
+  $("studentListHint").textContent = `${state.students.length} listed`;
+  $("studentList").innerHTML = state.students.length
+    ? state.students
+        .map(
+          (a) =>
+            `<li>${locked ? "" : `<button class="btn danger" type="button" data-remove="${a}" title="Remove student">−</button>`}<span class="mono">${a}</span></li>`
+        )
+        .join("")
+    : `<li class="empty">No students yet.</li>`;
 }
 
 function renderMine() {
@@ -451,6 +476,15 @@ $("studentsForm").addEventListener("submit", async (e) => {
     if (!ok) return;
   }
   $("studentsInput").value = "";
+});
+
+$("studentList").addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-remove]");
+  if (!b || b.disabled) return;
+  const addr = b.dataset.remove;
+  if (!confirm(`Remove ${addr} from the student list?`)) return;
+  b.disabled = true;
+  await send(`Remove ${addr.slice(0, 6)}…${addr.slice(-4)}`, () => write("removeStudent", addr));
 });
 
 $("courseForm").addEventListener("submit", async (e) => {
