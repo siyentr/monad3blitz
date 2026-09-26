@@ -137,6 +137,17 @@ pnpm verify:testnet 0xContractAddress
 Then open `https://testnet.monadexplorer.com/address/0xContractAddress` to see the verified code.
 Anyone can check that the rules really are fair.
 
+### Load test (optional)
+
+`scripts/load-test.js` deploys a fresh contract, creates N wallets, funds each for one apply and one
+reveal, fires all applications at once, then reveals and draws. Spread student transactions over
+several RPCs, since public RPCs are rate limited:
+
+```bash
+N=300 pnpm load:local                                          # against `pnpm chain`
+N=5000 RPCS=https://rpc-a,https://rpc-b pnpm load:testnet      # costs roughly N x 0.0004 MON
+```
+
 ### 5. Run the frontend and set up registration
 
 ```bash
