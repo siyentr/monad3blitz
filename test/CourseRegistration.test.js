@@ -2,6 +2,10 @@ const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { time, loadFixture } = require("@nomicfoundation/hardhat-network-helpers");
 
+const secretOf = (label) => ethers.id(`secret-${label}`);
+const commitmentOf = (courseId, student, secret) =>
+  ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["uint256", "address", "bytes32"], [courseId, student, secret]));
+
 describe("CourseRegistration", function () {
   async function deployFixture() {
     const [admin, alice, bob, carol, outsider, ...rest] = await ethers.getSigners();
@@ -15,10 +19,15 @@ describe("CourseRegistration", function () {
 
     const now = await time.latest();
     const start = now + 3600;
-    const end = start + 86400;
-    await reg.setRegistrationWindow(start, end);
+    const applyEnd = start + 300;
+    const revealEnd = applyEnd + 300;
+    await reg.setSchedule(start, applyEnd, revealEnd);
 
-    return { reg, admin, alice, bob, carol, outsider, rest, start, end };
+    // Student applies to a course with a secret derived from their address
+    const apply = (student, courseId) =>
+      reg.connect(student).applyFor(courseId, commitmentOf(courseId, student.address, secretOf(student.address)));
+
+    return { reg, admin, alice, bob, carol, outsider, rest, start, applyEnd, revealEnd, apply };
   }
 
   async function openFixture() {
@@ -64,13 +73,22 @@ describe("CourseRegistration", function () {
       expect(await reg.totalSupply()).to.equal(60);
     });
 
-    it("locks all admin setup once the window opens", async function () {
-      const { reg, alice, outsider, end } = await loadFixture(openFixture);
+    it("locks all admin setup once applications open", async function () {
+      const { reg, alice, outsider, revealEnd } = await loadFixture(openFixture);
       await expect(reg.addStudents([outsider.address])).to.be.revertedWithCustomError(reg, "SetupLocked");
       await expect(reg.removeStudent(alice.address)).to.be.revertedWithCustomError(reg, "SetupLocked");
       await expect(reg.addCourse("X", "X", 5, 5)).to.be.revertedWithCustomError(reg, "SetupLocked");
       await expect(reg.updateCourse(0, 5, 100)).to.be.revertedWithCustomError(reg, "SetupLocked");
-      await expect(reg.setRegistrationWindow(end + 10, end + 20)).to.be.revertedWithCustomError(reg, "SetupLocked");
+      await expect(reg.setSchedule(revealEnd + 10, revealEnd + 20, revealEnd + 30)).to.be.revertedWithCustomError(
+        reg,
+        "SetupLocked"
+      );
+    });
+
+    it("validates the schedule", async function () {
+      const { reg, start } = await loadFixture(deployFixture);
+      await expect(reg.setSchedule(start, start, start + 10)).to.be.revertedWithCustomError(reg, "InvalidWindow");
+      await expect(reg.setSchedule(start, start + 10, start + 10)).to.be.revertedWithCustomError(reg, "InvalidWindow");
     });
   });
 
@@ -86,105 +104,55 @@ describe("CourseRegistration", function () {
     });
   });
 
-  describe("Enrollment", function () {
-    it("is closed before the window", async function () {
-      const { reg, alice } = await loadFixture(deployFixture);
+  describe("Apply", function () {
+    it("is closed before and after the apply window", async function () {
+      const { reg, alice, apply, applyEnd } = await loadFixture(deployFixture);
       expect(await reg.phase()).to.equal(0);
-      await expect(reg.connect(alice).enroll(0)).to.be.revertedWithCustomError(reg, "RegistrationClosed");
-    });
-
-    it("is closed after the window", async function () {
-      const { reg, alice, end } = await loadFixture(deployFixture);
-      await time.increaseTo(end);
+      await expect(apply(alice, 0)).to.be.revertedWithCustomError(reg, "WrongPhase");
+      await time.increaseTo(applyEnd);
       expect(await reg.phase()).to.equal(2);
-      await expect(reg.connect(alice).enroll(0)).to.be.revertedWithCustomError(reg, "RegistrationClosed");
+      await expect(apply(alice, 0)).to.be.revertedWithCustomError(reg, "WrongPhase");
     });
 
-    it("spends AKTS and takes a seat", async function () {
-      const { reg, alice } = await loadFixture(openFixture);
-      await expect(reg.connect(alice).enroll(1)).to.emit(reg, "Enrolled").withArgs(1, alice.address, 1);
+    it("stores the commitment and reserves AKTS", async function () {
+      const { reg, alice, apply } = await loadFixture(openFixture);
+      const c = commitmentOf(1, alice.address, secretOf(alice.address));
+      await expect(apply(alice, 1)).to.emit(reg, "Applied").withArgs(1, alice.address, c);
+      expect(await reg.commitments(1, alice.address)).to.equal(c);
       expect(await reg.balanceOf(alice.address)).to.equal(22);
-      expect(await reg.isEnrolled(1, alice.address)).to.equal(true);
-      expect((await reg.getCourse(1)).enrolled).to.equal(1);
-      expect(await reg.getRoster(1)).to.deep.equal([alice.address]);
-      expect(await reg.getStudentCourses(alice.address)).to.deep.equal([1n]);
+      expect((await reg.getCourse(1)).applicants).to.equal(1);
     });
 
     it("rejects non-students", async function () {
-      const { reg, outsider } = await loadFixture(openFixture);
-      await expect(reg.connect(outsider).enroll(0)).to.be.revertedWithCustomError(reg, "NotStudent");
+      const { reg, outsider, apply } = await loadFixture(openFixture);
+      await expect(apply(outsider, 0)).to.be.revertedWithCustomError(reg, "NotStudent");
     });
 
-    it("rejects double enrollment", async function () {
-      const { reg, alice } = await loadFixture(openFixture);
-      await reg.connect(alice).enroll(0);
-      await expect(reg.connect(alice).enroll(0)).to.be.revertedWithCustomError(reg, "AlreadyEnrolled");
+    it("rejects double application", async function () {
+      const { reg, alice, apply } = await loadFixture(openFixture);
+      await apply(alice, 0);
+      await expect(apply(alice, 0)).to.be.revertedWithCustomError(reg, "AlreadyApplied");
     });
 
-    it("rejects invalid course", async function () {
-      const { reg, alice } = await loadFixture(openFixture);
-      await expect(reg.connect(alice).enroll(99)).to.be.revertedWithCustomError(reg, "InvalidCourse");
+    it("rejects invalid course and empty commitment", async function () {
+      const { reg, alice, apply } = await loadFixture(openFixture);
+      await expect(apply(alice, 99)).to.be.revertedWithCustomError(reg, "InvalidCourse");
+      await expect(reg.connect(alice).applyFor(0, ethers.ZeroHash)).to.be.revertedWithCustomError(reg, "InvalidParams");
     });
 
-    it("enforces capacity (first come, first served)", async function () {
-      const { reg, alice, bob, carol } = await loadFixture(openFixture);
-      await reg.connect(alice).enroll(0);
-      await reg.connect(bob).enroll(0);
-      await expect(reg.connect(carol).enroll(0)).to.be.revertedWithCustomError(reg, "CourseFull");
-      expect(await reg.balanceOf(carol.address)).to.equal(30);
+    it("more applicants than seats is fine: there is no race", async function () {
+      const { reg, alice, bob, carol, apply } = await loadFixture(openFixture);
+      for (const s of [alice, bob, carol]) await apply(s, 0); // capacity 2
+      expect((await reg.getCourse(0)).applicants).to.equal(3);
     });
 
-    it("cannot exceed 30 AKTS", async function () {
-      const { reg, alice } = await loadFixture(openFixture);
-      await reg.connect(alice).enroll(2); // 20 -> 10 left
-      await expect(reg.connect(alice).enroll(1)) // needs 8, has 10 -> ok
-        .to.emit(reg, "Enrolled");
-      await expect(reg.connect(alice).enroll(0)) // needs 6, has 2
+    it("cannot apply to more than 30 AKTS", async function () {
+      const { reg, alice, apply } = await loadFixture(openFixture);
+      await apply(alice, 2); // 20 -> 10 left
+      await apply(alice, 1); // 8 -> 2 left
+      await expect(apply(alice, 0)) // needs 6, has 2
         .to.be.revertedWithCustomError(reg, "InsufficientAKTS")
         .withArgs(2, 6);
-    });
-
-    it("drop refunds AKTS and frees the seat for someone else", async function () {
-      const { reg, alice, bob, carol } = await loadFixture(openFixture);
-      await reg.connect(alice).enroll(0);
-      await reg.connect(bob).enroll(0);
-      await expect(reg.connect(alice).drop(0)).to.emit(reg, "Dropped").withArgs(0, alice.address, 1);
-      expect(await reg.balanceOf(alice.address)).to.equal(30);
-      expect(await reg.getRoster(0)).to.deep.equal([bob.address]);
-      await reg.connect(carol).enroll(0);
-      expect(await reg.getRoster(0)).to.deep.equal([bob.address, carol.address]);
-      expect(await reg.totalSupply()).to.equal(90 - 12);
-    });
-
-    it("cannot drop a course you're not in", async function () {
-      const { reg, alice } = await loadFixture(openFixture);
-      await expect(reg.connect(alice).drop(0)).to.be.revertedWithCustomError(reg, "NotEnrolled");
-    });
-  });
-
-  describe("Rush", function () {
-    it("50 students race for 10 seats: exactly 10 win, the rest keep their AKTS", async function () {
-      const signers = (await ethers.getSigners()).slice(1, 51);
-      const Reg = await ethers.getContractFactory("CourseRegistration");
-      const reg = await Reg.deploy();
-      await reg.addStudents(signers.map((s) => s.address));
-      await reg.addCourse("CENG999", "Popular Elective", 5, 10);
-      const start = (await time.latest()) + 60;
-      await reg.setRegistrationWindow(start, start + 3600);
-      await time.increaseTo(start);
-
-      // Put all 50 txs into the same block, like the real rush
-      await ethers.provider.send("evm_setAutomine", [false]);
-      const txs = await Promise.all(signers.map((s) => reg.connect(s).enroll(0, { gasLimit: 300000 })));
-      await ethers.provider.send("evm_mine", []);
-      await ethers.provider.send("evm_setAutomine", [true]);
-
-      const receipts = await Promise.all(txs.map((t) => ethers.provider.getTransactionReceipt(t.hash)));
-      const ok = receipts.filter((r) => r.status === 1).length;
-      expect(ok).to.equal(10);
-      expect((await reg.getCourse(0)).enrolled).to.equal(10);
-      expect(await reg.getRoster(0)).to.have.length(10);
-      expect(await reg.totalSupply()).to.equal(50 * 30 - 10 * 5);
     });
   });
 });

@@ -1,5 +1,5 @@
 // Local demo: registers hardhat accounts #1-#10 as students, adds sample courses,
-// and opens registration 2 minutes from now for 1 hour.
+// and opens applications 2 minutes from now: apply for 5 min, then reveal for 5 min.
 const hre = require("hardhat");
 
 const COURSES = [
@@ -23,10 +23,10 @@ async function main() {
 
   const now = (await hre.ethers.provider.getBlock("latest")).timestamp;
   const start = now + 120;
-  await (await reg.setRegistrationWindow(start, start + 3600)).wait();
+  await (await reg.setSchedule(start, start + 300, start + 600)).wait();
 
   console.log(`Seeded ${students.length} students, ${COURSES.length} courses.`);
-  console.log(`Registration opens at ${new Date(start * 1000).toLocaleString()}`);
+  console.log(`Applications open at ${new Date(start * 1000).toLocaleString()}`);
   console.log("Student accounts (import into MetaMask from `pnpm exec hardhat node` output): #1 - #10");
 }
 

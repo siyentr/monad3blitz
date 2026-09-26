@@ -2,11 +2,15 @@
 pragma solidity ^0.8.24;
 
 /// @title CourseRegistration
-/// @notice Fair, first-come-first-served university course selection on Monad.
+/// @notice Fair university course selection on Monad by commit-reveal lottery.
+///         First come, first served is unfair even on-chain: the block producer orders transactions,
+///         so fees, bots and network speed decide who gets a seat. Here there is no race:
+///         students apply with a hashed secret, reveal it later, and seats are drawn from a seed
+///         that depends on every revealed secret.
 ///         Every registered student receives 30 AKTS (soulbound, non-transferable credits).
-///         Enrolling in a course spends its AKTS; dropping refunds them.
-///         The admin prepares students, courses and the registration window, but once the
-///         window opens the admin can no longer change anything — nobody gets special treatment.
+///         Applying to a course reserves its AKTS.
+///         The admin prepares students, courses and the schedule, but once applications open
+///         the admin can no longer change anything — nobody gets special treatment.
 contract CourseRegistration {
     // ---------------------------------------------------------------------
     // AKTS token metadata (ERC20-compatible reads, transfers disabled)
@@ -28,19 +32,24 @@ contract CourseRegistration {
         uint8 akts;
         uint32 capacity;
         uint32 enrolled;
+        uint32 applicants;
     }
 
     address public admin;
-    uint64 public registrationStart;
-    uint64 public registrationEnd;
+    uint64 public applyStart;
+    uint64 public applyEnd;
+    uint64 public revealEnd;
 
     Course[] private _courses;
     mapping(address => bool) public isStudent;
     uint256 public studentCount;
 
-    // courseId => roster, plus 1-based index for O(1) removal (0 = not enrolled)
+    // courseId => roster, plus 1-based index (0 = not enrolled)
     mapping(uint256 => address[]) private _roster;
     mapping(uint256 => mapping(address => uint256)) private _rosterIndex;
+
+    // courseId => student => keccak256(abi.encode(courseId, student, secret))
+    mapping(uint256 => mapping(address => bytes32)) public commitments;
 
     // ---------------------------------------------------------------------
     // Events
@@ -51,22 +60,19 @@ contract CourseRegistration {
     event StudentRemoved(address indexed student);
     event CourseAdded(uint256 indexed courseId, string code, string title, uint8 akts, uint32 capacity);
     event CourseUpdated(uint256 indexed courseId, uint8 akts, uint32 capacity);
-    event RegistrationWindowSet(uint64 start, uint64 end);
-    event Enrolled(uint256 indexed courseId, address indexed student, uint32 seatsTaken);
-    event Dropped(uint256 indexed courseId, address indexed student, uint32 seatsTaken);
+    event ScheduleSet(uint64 applyStart, uint64 applyEnd, uint64 revealEnd);
+    event Applied(uint256 indexed courseId, address indexed student, bytes32 commitment);
 
     // ---------------------------------------------------------------------
     // Errors
     // ---------------------------------------------------------------------
     error NotAdmin();
     error SetupLocked();
-    error RegistrationClosed();
+    error WrongPhase();
     error NotStudent();
     error AlreadyStudent(address student);
     error InvalidCourse();
-    error CourseFull();
-    error AlreadyEnrolled();
-    error NotEnrolled();
+    error AlreadyApplied();
     error InsufficientAKTS(uint256 have, uint256 need);
     error InvalidWindow();
     error InvalidParams();
@@ -77,16 +83,14 @@ contract CourseRegistration {
         _;
     }
 
-    /// @dev Setup is allowed only until the registration window opens.
+    /// @dev Setup is allowed only until applications open.
     modifier setupPhase() {
-        if (registrationStart != 0 && block.timestamp >= registrationStart) revert SetupLocked();
+        if (applyStart != 0 && block.timestamp >= applyStart) revert SetupLocked();
         _;
     }
 
-    modifier registrationOpen() {
-        if (registrationStart == 0 || block.timestamp < registrationStart || block.timestamp >= registrationEnd) {
-            revert RegistrationClosed();
-        }
+    modifier applyOpen() {
+        if (applyStart == 0 || block.timestamp < applyStart || block.timestamp >= applyEnd) revert WrongPhase();
         _;
     }
 
@@ -146,7 +150,7 @@ contract CourseRegistration {
     {
         if (akts == 0 || akts > AKTS_PER_STUDENT || capacity == 0 || bytes(code).length == 0) revert InvalidParams();
         courseId = _courses.length;
-        _courses.push(Course({code: code, title: title, akts: akts, capacity: capacity, enrolled: 0}));
+        _courses.push(Course({code: code, title: title, akts: akts, capacity: capacity, enrolled: 0, applicants: 0}));
         emit CourseAdded(courseId, code, title, akts, capacity);
     }
 
@@ -163,58 +167,39 @@ contract CourseRegistration {
         emit CourseUpdated(courseId, akts, capacity);
     }
 
-    /// @notice Set the registration window. Once `start` passes, all admin setup functions are locked.
-    function setRegistrationWindow(uint64 start, uint64 end) external onlyAdmin setupPhase {
-        if (start < block.timestamp || end <= start) revert InvalidWindow();
-        registrationStart = start;
-        registrationEnd = end;
-        emit RegistrationWindowSet(start, end);
+    /// @notice Set the schedule: apply in [applyStart, applyEnd), reveal in [applyEnd, revealEnd),
+    ///         draw after revealEnd. Once `applyStart_` passes, all admin setup functions are locked.
+    function setSchedule(uint64 applyStart_, uint64 applyEnd_, uint64 revealEnd_) external onlyAdmin setupPhase {
+        if (applyStart_ < block.timestamp || applyEnd_ <= applyStart_ || revealEnd_ <= applyEnd_) revert InvalidWindow();
+        applyStart = applyStart_;
+        applyEnd = applyEnd_;
+        revealEnd = revealEnd_;
+        emit ScheduleSet(applyStart_, applyEnd_, revealEnd_);
     }
 
     // =====================================================================
     // Students
     // =====================================================================
 
-    function enroll(uint256 courseId) external registrationOpen validCourse(courseId) {
+    /// @notice Apply to a course with `commitment = keccak256(abi.encode(courseId, msg.sender, secret))`.
+    ///         Keep `secret` safe: it must be revealed later or the application is void.
+    ///         Reserves the course's AKTS.
+    function applyFor(uint256 courseId, bytes32 commitment) external applyOpen validCourse(courseId) {
         if (!isStudent[msg.sender]) revert NotStudent();
-        if (_rosterIndex[courseId][msg.sender] != 0) revert AlreadyEnrolled();
+        if (commitment == bytes32(0)) revert InvalidParams();
+        if (commitments[courseId][msg.sender] != bytes32(0)) revert AlreadyApplied();
 
         Course storage c = _courses[courseId];
-        if (c.enrolled >= c.capacity) revert CourseFull();
-
         uint256 bal = balanceOf[msg.sender];
         if (bal < c.akts) revert InsufficientAKTS(bal, c.akts);
 
         balanceOf[msg.sender] = bal - c.akts;
         totalSupply -= c.akts;
-        c.enrolled += 1;
-
-        _roster[courseId].push(msg.sender);
-        _rosterIndex[courseId][msg.sender] = _roster[courseId].length;
+        c.applicants += 1;
+        commitments[courseId][msg.sender] = commitment;
 
         emit Transfer(msg.sender, address(0), c.akts);
-        emit Enrolled(courseId, msg.sender, c.enrolled);
-    }
-
-    function drop(uint256 courseId) external registrationOpen validCourse(courseId) {
-        uint256 idx = _rosterIndex[courseId][msg.sender];
-        if (idx == 0) revert NotEnrolled();
-
-        // swap-and-pop removal from roster
-        address[] storage roster = _roster[courseId];
-        address last = roster[roster.length - 1];
-        roster[idx - 1] = last;
-        _rosterIndex[courseId][last] = idx;
-        roster.pop();
-        delete _rosterIndex[courseId][msg.sender];
-
-        Course storage c = _courses[courseId];
-        c.enrolled -= 1;
-        balanceOf[msg.sender] += c.akts;
-        totalSupply += c.akts;
-
-        emit Transfer(address(0), msg.sender, c.akts);
-        emit Dropped(courseId, msg.sender, c.enrolled);
+        emit Applied(courseId, msg.sender, commitment);
     }
 
     // =====================================================================
@@ -274,10 +259,11 @@ contract CourseRegistration {
         }
     }
 
-    /// @return 0 = setup, 1 = open, 2 = closed
+    /// @return 0 = setup, 1 = apply, 2 = reveal, 3 = draw
     function phase() external view returns (uint8) {
-        if (registrationStart == 0 || block.timestamp < registrationStart) return 0;
-        if (block.timestamp < registrationEnd) return 1;
-        return 2;
+        if (applyStart == 0 || block.timestamp < applyStart) return 0;
+        if (block.timestamp < applyEnd) return 1;
+        if (block.timestamp < revealEnd) return 2;
+        return 3;
     }
 }
