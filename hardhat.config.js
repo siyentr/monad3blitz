@@ -12,8 +12,7 @@ module.exports = {
     settings: { optimizer: { enabled: true, runs: 200 }, evmVersion: "cancun" },
   },
   networks: {
-    // High block gas limit so the draw benchmark can measure very large single transactions
-    hardhat: { accounts: { count: 60 }, hardfork: "cancun", blockGasLimit: 1_000_000_000 },
+    hardhat: { accounts: { count: 60 } },
     monadTestnet: {
       url: process.env.MONAD_TESTNET_RPC || "https://testnet-rpc.monad.xyz",
       chainId: 10143,

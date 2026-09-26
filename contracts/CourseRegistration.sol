@@ -2,15 +2,11 @@
 pragma solidity ^0.8.24;
 
 /// @title CourseRegistration
-/// @notice Fair university course selection on Monad by commit-reveal lottery.
-///         First come, first served is unfair even on-chain: the block producer orders transactions,
-///         so fees, bots and network speed decide who gets a seat. Here there is no race:
-///         students apply with a hashed secret, reveal it later, and seats are drawn from a seed
-///         that depends on every revealed secret.
+/// @notice Fair, first-come-first-served university course selection on Monad.
 ///         Every registered student receives 30 AKTS (soulbound, non-transferable credits).
-///         Applying to a course reserves its AKTS.
-///         The admin prepares students, courses and the schedule, but once applications open
-///         the admin can no longer change anything — nobody gets special treatment.
+///         Enrolling in a course spends its AKTS; dropping refunds them.
+///         The admin prepares students, courses and the registration window, but once the
+///         window opens the admin can no longer change anything — nobody gets special treatment.
 contract CourseRegistration {
     // ---------------------------------------------------------------------
     // AKTS token metadata (ERC20-compatible reads, transfers disabled)
@@ -32,41 +28,19 @@ contract CourseRegistration {
         uint8 akts;
         uint32 capacity;
         uint32 enrolled;
-        uint32 applicants;
     }
 
     address public admin;
-    uint64 public applyStart;
-    uint64 public applyEnd;
-    uint64 public revealEnd;
+    uint64 public registrationStart;
+    uint64 public registrationEnd;
 
     Course[] private _courses;
     mapping(address => bool) public isStudent;
     uint256 public studentCount;
 
-    // courseId => roster, plus 1-based index (0 = not enrolled)
+    // courseId => roster, plus 1-based index for O(1) removal (0 = not enrolled)
     mapping(uint256 => address[]) private _roster;
     mapping(uint256 => mapping(address => uint256)) private _rosterIndex;
-
-    // courseId => student => keccak256(abi.encode(courseId, student, secret))
-    mapping(uint256 => mapping(address => bytes32)) public commitments;
-    mapping(uint256 => mapping(address => bool)) public revealed;
-
-    // courseId => XOR of revealed secrets (order-independent) and the revealed applicants
-    mapping(uint256 => bytes32) public seedAcc;
-    mapping(uint256 => address[]) internal _pool;
-
-    // Draw state. Each applicant's score is keccak256(seed, student); the `capacity` lowest scores win.
-    // A max-heap of the best scores so far lets the draw run in batches over thousands of applicants.
-    struct Entry {
-        bytes32 score;
-        address student;
-    }
-
-    mapping(uint256 => Entry[]) private _heap;
-    mapping(uint256 => uint256) public drawCursor;
-    mapping(uint256 => bool) public drawn;
-    mapping(uint256 => mapping(address => bool)) public refunded;
 
     // ---------------------------------------------------------------------
     // Events
@@ -77,28 +51,22 @@ contract CourseRegistration {
     event StudentRemoved(address indexed student);
     event CourseAdded(uint256 indexed courseId, string code, string title, uint8 akts, uint32 capacity);
     event CourseUpdated(uint256 indexed courseId, uint8 akts, uint32 capacity);
-    event ScheduleSet(uint64 applyStart, uint64 applyEnd, uint64 revealEnd);
-    event Applied(uint256 indexed courseId, address indexed student, bytes32 commitment);
-    event Revealed(uint256 indexed courseId, address indexed student, bytes32 secret);
-    event DrawFinished(uint256 indexed courseId, bytes32 seed, uint32 winners);
-    event Refunded(uint256 indexed courseId, address indexed student, uint256 akts);
+    event RegistrationWindowSet(uint64 start, uint64 end);
+    event Enrolled(uint256 indexed courseId, address indexed student, uint32 seatsTaken);
+    event Dropped(uint256 indexed courseId, address indexed student, uint32 seatsTaken);
 
     // ---------------------------------------------------------------------
     // Errors
     // ---------------------------------------------------------------------
     error NotAdmin();
     error SetupLocked();
-    error WrongPhase();
+    error RegistrationClosed();
     error NotStudent();
     error AlreadyStudent(address student);
     error InvalidCourse();
-    error AlreadyApplied();
-    error NotApplied();
-    error AlreadyRevealed();
-    error WrongSecret();
-    error AlreadyDrawn();
-    error NotDrawn();
-    error NotRefundable();
+    error CourseFull();
+    error AlreadyEnrolled();
+    error NotEnrolled();
     error InsufficientAKTS(uint256 have, uint256 need);
     error InvalidWindow();
     error InvalidParams();
@@ -109,24 +77,16 @@ contract CourseRegistration {
         _;
     }
 
-    /// @dev Setup is allowed only until applications open.
+    /// @dev Setup is allowed only until the registration window opens.
     modifier setupPhase() {
-        if (applyStart != 0 && block.timestamp >= applyStart) revert SetupLocked();
+        if (registrationStart != 0 && block.timestamp >= registrationStart) revert SetupLocked();
         _;
     }
 
-    modifier applyOpen() {
-        if (applyStart == 0 || block.timestamp < applyStart || block.timestamp >= applyEnd) revert WrongPhase();
-        _;
-    }
-
-    modifier revealOpen() {
-        if (applyStart == 0 || block.timestamp < applyEnd || block.timestamp >= revealEnd) revert WrongPhase();
-        _;
-    }
-
-    modifier drawOpen() {
-        if (applyStart == 0 || block.timestamp < revealEnd) revert WrongPhase();
+    modifier registrationOpen() {
+        if (registrationStart == 0 || block.timestamp < registrationStart || block.timestamp >= registrationEnd) {
+            revert RegistrationClosed();
+        }
         _;
     }
 
@@ -186,7 +146,7 @@ contract CourseRegistration {
     {
         if (akts == 0 || akts > AKTS_PER_STUDENT || capacity == 0 || bytes(code).length == 0) revert InvalidParams();
         courseId = _courses.length;
-        _courses.push(Course({code: code, title: title, akts: akts, capacity: capacity, enrolled: 0, applicants: 0}));
+        _courses.push(Course({code: code, title: title, akts: akts, capacity: capacity, enrolled: 0}));
         emit CourseAdded(courseId, code, title, akts, capacity);
     }
 
@@ -203,146 +163,58 @@ contract CourseRegistration {
         emit CourseUpdated(courseId, akts, capacity);
     }
 
-    /// @notice Set the schedule: apply in [applyStart, applyEnd), reveal in [applyEnd, revealEnd),
-    ///         draw after revealEnd. Once `applyStart_` passes, all admin setup functions are locked.
-    function setSchedule(uint64 applyStart_, uint64 applyEnd_, uint64 revealEnd_) external onlyAdmin setupPhase {
-        if (applyStart_ < block.timestamp || applyEnd_ <= applyStart_ || revealEnd_ <= applyEnd_) revert InvalidWindow();
-        applyStart = applyStart_;
-        applyEnd = applyEnd_;
-        revealEnd = revealEnd_;
-        emit ScheduleSet(applyStart_, applyEnd_, revealEnd_);
+    /// @notice Set the registration window. Once `start` passes, all admin setup functions are locked.
+    function setRegistrationWindow(uint64 start, uint64 end) external onlyAdmin setupPhase {
+        if (start < block.timestamp || end <= start) revert InvalidWindow();
+        registrationStart = start;
+        registrationEnd = end;
+        emit RegistrationWindowSet(start, end);
     }
 
     // =====================================================================
     // Students
     // =====================================================================
 
-    /// @notice Apply to a course with `commitment = keccak256(abi.encode(courseId, msg.sender, secret))`.
-    ///         Keep `secret` safe: it must be revealed later or the application is void.
-    ///         Reserves the course's AKTS.
-    function applyFor(uint256 courseId, bytes32 commitment) external applyOpen validCourse(courseId) {
+    function enroll(uint256 courseId) external registrationOpen validCourse(courseId) {
         if (!isStudent[msg.sender]) revert NotStudent();
-        if (commitment == bytes32(0)) revert InvalidParams();
-        if (commitments[courseId][msg.sender] != bytes32(0)) revert AlreadyApplied();
+        if (_rosterIndex[courseId][msg.sender] != 0) revert AlreadyEnrolled();
 
         Course storage c = _courses[courseId];
+        if (c.enrolled >= c.capacity) revert CourseFull();
+
         uint256 bal = balanceOf[msg.sender];
         if (bal < c.akts) revert InsufficientAKTS(bal, c.akts);
 
         balanceOf[msg.sender] = bal - c.akts;
         totalSupply -= c.akts;
-        c.applicants += 1;
-        commitments[courseId][msg.sender] = commitment;
+        c.enrolled += 1;
+
+        _roster[courseId].push(msg.sender);
+        _rosterIndex[courseId][msg.sender] = _roster[courseId].length;
 
         emit Transfer(msg.sender, address(0), c.akts);
-        emit Applied(courseId, msg.sender, commitment);
+        emit Enrolled(courseId, msg.sender, c.enrolled);
     }
 
-    /// @notice Reveal the secret behind an application. Only revealed applicants enter the draw;
-    ///         an unrevealed application is void and its AKTS are not refunded.
-    function reveal(uint256 courseId, bytes32 secret) external revealOpen validCourse(courseId) {
-        bytes32 commitment = commitments[courseId][msg.sender];
-        if (commitment == bytes32(0)) revert NotApplied();
-        if (revealed[courseId][msg.sender]) revert AlreadyRevealed();
-        if (keccak256(abi.encode(courseId, msg.sender, secret)) != commitment) revert WrongSecret();
+    function drop(uint256 courseId) external registrationOpen validCourse(courseId) {
+        uint256 idx = _rosterIndex[courseId][msg.sender];
+        if (idx == 0) revert NotEnrolled();
 
-        revealed[courseId][msg.sender] = true;
-        seedAcc[courseId] ^= secret;
-        _pool[courseId].push(msg.sender);
-
-        emit Revealed(courseId, msg.sender, secret);
-    }
-
-    // =====================================================================
-    // Draw (anyone can call it, so the admin cannot stall it)
-    // =====================================================================
-
-    /// @notice Final random seed of a course. Fixed once the reveal window closes.
-    function drawSeed(uint256 courseId) public view returns (bytes32) {
-        return keccak256(abi.encode(seedAcc[courseId], courseId, address(this)));
-    }
-
-    /// @notice Run the draw for up to `maxSteps` applicants. Call repeatedly until `drawn(courseId)`.
-    ///         The winners are the same for any batch size and any reveal order.
-    function draw(uint256 courseId, uint256 maxSteps) external drawOpen validCourse(courseId) {
-        if (drawn[courseId]) revert AlreadyDrawn();
-        if (maxSteps == 0) revert InvalidParams();
+        // swap-and-pop removal from roster
+        address[] storage roster = _roster[courseId];
+        address last = roster[roster.length - 1];
+        roster[idx - 1] = last;
+        _rosterIndex[courseId][last] = idx;
+        roster.pop();
+        delete _rosterIndex[courseId][msg.sender];
 
         Course storage c = _courses[courseId];
-        address[] storage pool = _pool[courseId];
-        Entry[] storage heap = _heap[courseId];
-        bytes32 seed = drawSeed(courseId);
-        uint256 n = pool.length;
-        uint256 cursor = drawCursor[courseId];
-        uint256 steps;
+        c.enrolled -= 1;
+        balanceOf[msg.sender] += c.akts;
+        totalSupply += c.akts;
 
-        // Pass 1: keep the `capacity` lowest scores in the heap
-        for (; cursor < n && steps < maxSteps; steps++) {
-            address student = pool[cursor++];
-            bytes32 score = keccak256(abi.encode(seed, student));
-            if (heap.length < c.capacity) {
-                heap.push(Entry(score, student));
-                _siftUp(heap, heap.length - 1);
-            } else if (score < heap[0].score) {
-                heap[0] = Entry(score, student);
-                _siftDown(heap, 0);
-            }
-        }
-        drawCursor[courseId] = cursor;
-
-        // Pass 2: seat the winners
-        address[] storage roster = _roster[courseId];
-        while (cursor == n && roster.length < heap.length && steps < maxSteps) {
-            address winner = heap[roster.length].student;
-            roster.push(winner);
-            _rosterIndex[courseId][winner] = roster.length;
-            steps++;
-        }
-
-        if (cursor == n && roster.length == heap.length) {
-            drawn[courseId] = true;
-            c.enrolled = uint32(roster.length);
-            emit DrawFinished(courseId, seed, c.enrolled);
-        }
-    }
-
-    /// @notice Get the reserved AKTS back after losing the draw. Unrevealed applications are not refunded.
-    function claimRefund(uint256 courseId) external validCourse(courseId) {
-        if (!drawn[courseId]) revert NotDrawn();
-        if (!revealed[courseId][msg.sender] || isEnrolled(courseId, msg.sender) || refunded[courseId][msg.sender]) {
-            revert NotRefundable();
-        }
-        refunded[courseId][msg.sender] = true;
-        uint256 akts = _courses[courseId].akts;
-        balanceOf[msg.sender] += akts;
-        totalSupply += akts;
-        emit Transfer(address(0), msg.sender, akts);
-        emit Refunded(courseId, msg.sender, akts);
-    }
-
-    function _siftUp(Entry[] storage heap, uint256 i) private {
-        Entry memory e = heap[i];
-        while (i > 0) {
-            uint256 parent = (i - 1) / 2;
-            if (heap[parent].score >= e.score) break;
-            heap[i] = heap[parent];
-            i = parent;
-        }
-        heap[i] = e;
-    }
-
-    function _siftDown(Entry[] storage heap, uint256 i) private {
-        uint256 len = heap.length;
-        Entry memory e = heap[i];
-        while (true) {
-            uint256 child = 2 * i + 1;
-            if (child >= len) break;
-            if (child + 1 < len && heap[child + 1].score > heap[child].score) child++;
-            if (heap[child].score <= e.score) break;
-            heap[i] = heap[child];
-            i = child;
-        }
-        heap[i] = e;
+        emit Transfer(address(0), msg.sender, c.akts);
+        emit Dropped(courseId, msg.sender, c.enrolled);
     }
 
     // =====================================================================
@@ -385,11 +257,6 @@ contract CourseRegistration {
         return _roster[courseId];
     }
 
-    /// @notice Applicants who revealed, in reveal order (order does not affect the draw).
-    function getPool(uint256 courseId) external view validCourse(courseId) returns (address[] memory) {
-        return _pool[courseId];
-    }
-
     function isEnrolled(uint256 courseId, address student) public view returns (bool) {
         return _rosterIndex[courseId][student] != 0;
     }
@@ -407,11 +274,10 @@ contract CourseRegistration {
         }
     }
 
-    /// @return 0 = setup, 1 = apply, 2 = reveal, 3 = draw
+    /// @return 0 = setup, 1 = open, 2 = closed
     function phase() external view returns (uint8) {
-        if (applyStart == 0 || block.timestamp < applyStart) return 0;
-        if (block.timestamp < applyEnd) return 1;
-        if (block.timestamp < revealEnd) return 2;
-        return 3;
+        if (registrationStart == 0 || block.timestamp < registrationStart) return 0;
+        if (block.timestamp < registrationEnd) return 1;
+        return 2;
     }
 }
