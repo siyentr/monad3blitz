@@ -1,5 +1,7 @@
 # AKTS Course Registration on Monad
 
+![OBS-web3: fair course registration on Monad](docs/obs-web3.png)
+
 Fair university course selection. In Türkiye, course registration day means crashed university
 servers, students who "know someone" and seats that vanish before the page loads. This project
 moves registration onto Monad so the rules are public and identical for everyone.
