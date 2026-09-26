@@ -22,16 +22,20 @@ const NETWORKS = {
 
 const ERRORS = {
   NotAdmin: "Only the admin can do that.",
-  SetupLocked: "Registration has started, so setup is locked.",
-  RegistrationClosed: "Registration is not open right now.",
+  SetupLocked: "Applications have opened, so setup is locked.",
+  WrongPhase: "That is not possible in the current phase.",
   NotStudent: "This wallet is not on the student list.",
   AlreadyStudent: "One of these addresses is already a student.",
   InvalidCourse: "That course does not exist.",
-  CourseFull: "Too late: the course is full.",
-  AlreadyEnrolled: "You are already enrolled in this course.",
-  NotEnrolled: "You are not enrolled in this course.",
+  AlreadyApplied: "You already applied to this course.",
+  NotApplied: "You did not apply to this course.",
+  AlreadyRevealed: "You already revealed for this course.",
+  WrongSecret: "This secret does not match your application.",
+  AlreadyDrawn: "The draw for this course is already finished.",
+  NotDrawn: "The draw for this course has not finished yet.",
+  NotRefundable: "Nothing to refund for this course.",
   InsufficientAKTS: "Not enough AKTS left for this course.",
-  InvalidWindow: "Invalid window: it must start in the future and end after it starts.",
+  InvalidWindow: "Invalid schedule: apply must start in the future, then apply end, then reveal end.",
   InvalidParams: "Invalid input.",
   Soulbound: "AKTS cannot be transferred.",
 };
@@ -44,11 +48,13 @@ const state = {
   writeContract: null,
   account: null,
   admin: null,
-  start: 0,
-  end: 0,
+  applyStart: 0,
+  applyEnd: 0,
+  revealEnd: 0,
   phase: 0,
   courses: [],
   myCourses: new Set(),
+  my: {}, // courseId -> { applied, revealed, refunded }
   balance: null,
   pending: new Set(), // course ids with an in-flight tx
 };
@@ -109,6 +115,39 @@ function toLocalInput(date) {
   return new Date(date.getTime() - off).toISOString().slice(0, 16);
 }
 
+// ---------------------------------------------------------------- secrets
+// The secret never leaves the browser until reveal. If it is lost, the application cannot be revealed,
+// so it is stored locally and also offered as a backup file before the apply transaction is sent.
+
+const DRAW_BATCH = 200; // applicants processed per draw() call, see `pnpm bench:draw`
+
+const secretKey = (courseId) => `akts-secret:${D.chainId}:${D.address}:${state.account}:${courseId}`;
+
+function loadSecret(courseId) {
+  try {
+    return localStorage.getItem(secretKey(courseId));
+  } catch {
+    return null;
+  }
+}
+
+function saveSecret(courseId, secret) {
+  try {
+    localStorage.setItem(secretKey(courseId), secret);
+  } catch {}
+  const backup = { contract: D.address, chainId: D.chainId, student: state.account, courseId, secret };
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" }));
+  a.download = `akts-secret-${state.courses[courseId].code}.json`;
+  a.click();
+}
+
+function commitmentOf(courseId, student, secret) {
+  return ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(["uint256", "address", "bytes32"], [courseId, student, secret])
+  );
+}
+
 // ---------------------------------------------------------------- wallet
 
 // EIP-6963: discover injected wallets so MetaMask is used even when other wallet
@@ -149,6 +188,7 @@ function disconnected() {
   state.writeContract = null;
   state.balance = null;
   state.myCourses = new Set();
+  state.my = {};
   $("connectBtn").textContent = "Connect wallet";
   render();
 }
@@ -213,17 +253,20 @@ function watchWallet() {
 
 async function refresh() {
   const c = state.readContract;
-  const [admin, start, end, phase, courses, studentCount] = await Promise.all([
+  const [admin, applyStart, applyEnd, revealEnd, phase, courses, studentCount] = await Promise.all([
     c.admin(),
-    c.registrationStart(),
-    c.registrationEnd(),
+    c.applyStart(),
+    c.applyEnd(),
+    c.revealEnd(),
     c.phase(),
     c.getAllCourses(),
     c.studentCount(),
   ]);
+  const drawn = await Promise.all(courses.map((_, id) => c.drawn(id)));
   state.admin = admin.toLowerCase();
-  state.start = Number(start);
-  state.end = Number(end);
+  state.applyStart = Number(applyStart);
+  state.applyEnd = Number(applyEnd);
+  state.revealEnd = Number(revealEnd);
   state.phase = Number(phase);
   state.courses = courses.map((x, id) => ({
     id,
@@ -232,6 +275,8 @@ async function refresh() {
     akts: Number(x.akts),
     capacity: Number(x.capacity),
     enrolled: Number(x.enrolled),
+    applicants: Number(x.applicants),
+    drawn: drawn[id],
   }));
   $("studentCount").textContent = studentCount.toString();
 
@@ -244,6 +289,13 @@ async function refresh() {
     state.balance = Number(bal);
     state.isStudent = isStudent;
     state.myCourses = new Set(mine.map(Number));
+    const me = state.account;
+    const rows = await Promise.all(
+      state.courses.map((x) => Promise.all([c.commitments(x.id, me), c.revealed(x.id, me), c.refunded(x.id, me)]))
+    );
+    state.my = Object.fromEntries(
+      rows.map(([commitment, revealed, refunded], id) => [id, { applied: commitment !== ethers.ZeroHash, revealed, refunded }])
+    );
   }
   render();
 }
@@ -252,8 +304,8 @@ async function refresh() {
 
 function render() {
   const badge = $("phaseBadge");
-  badge.textContent = ["Setup", "Open", "Closed"][state.phase];
-  badge.className = `badge ${["setup", "open", "closed"][state.phase]}`;
+  badge.textContent = ["Setup", "Apply", "Reveal", "Draw"][state.phase];
+  badge.className = `badge ${["setup", "open", "open", "closed"][state.phase]}`;
 
   $("myAkts").textContent = state.account ? (state.isStudent ? `${state.balance} / 30` : "not a student") : "—";
 
@@ -262,8 +314,37 @@ function render() {
 
   const isAdmin = state.account && state.account === state.admin;
   $("adminCard").classList.toggle("hidden", !isAdmin);
-  $("adminLock").textContent = state.phase === 0 ? "setup is open" : "🔒 locked: registration has started";
+  $("adminLock").textContent = state.phase === 0 ? "setup is open" : "🔒 locked: applications have opened";
   document.querySelectorAll("#adminCard form button").forEach((b) => (b.disabled = state.phase !== 0));
+}
+
+// Button for one course, depending on the phase and what this wallet has done so far
+function courseAction(c) {
+  const my = state.my[c.id] || {};
+  const busy = state.pending.has(c.id);
+  const student = state.account && state.isStudent;
+  const btn = (kind, action, label, dis = false) =>
+    `<button class="btn ${kind}" data-action="${action}" data-id="${c.id}" ${dis || busy ? "disabled" : ""}>${busy ? "…" : label}</button>`;
+  const done = (label) => `<span class="hint">${label}</span>`;
+
+  if (state.phase === 1) {
+    if (!student) return "";
+    if (my.applied) return done("Applied ✓");
+    const noAkts = state.balance !== null && state.balance < c.akts;
+    return btn("primary", "apply", noAkts ? "No AKTS" : "Apply", noAkts);
+  }
+  if (state.phase === 2) {
+    if (!my.applied) return "";
+    return my.revealed ? done("Revealed ✓") : btn("primary", "reveal", "Reveal");
+  }
+  if (state.phase === 3) {
+    if (!c.drawn) return state.account ? btn("", "draw", "Run draw") : done("Waiting for draw");
+    if (state.myCourses.has(c.id)) return done("Seat won ✓");
+    if (my.revealed && !my.refunded) return btn("", "refund", "Claim refund");
+    if (my.applied && !my.revealed) return done("Not revealed");
+    if (my.refunded) return done("Refunded");
+  }
+  return "";
 }
 
 function renderCourses() {
@@ -272,32 +353,23 @@ function renderCourses() {
     list.innerHTML = `<p class="empty">No courses yet.</p>`;
     return;
   }
-  const canAct = state.account && state.isStudent && state.phase === 1;
   list.innerHTML = state.courses
     .map((c) => {
-      const pct = Math.round((c.enrolled / c.capacity) * 100);
-      const full = c.enrolled >= c.capacity;
       const mine = state.myCourses.has(c.id);
-      const busy = state.pending.has(c.id);
-      let btn;
-      if (mine) {
-        btn = `<button class="btn danger" data-drop="${c.id}" ${!canAct || busy ? "disabled" : ""}>${busy ? "…" : "Drop"}</button>`;
-      } else {
-        const noAkts = state.balance !== null && state.balance < c.akts;
-        const dis = !canAct || full || noAkts || busy;
-        const label = busy ? "…" : full ? "Full" : noAkts ? "No AKTS" : "Enroll";
-        btn = `<button class="btn primary" data-enroll="${c.id}" ${dis ? "disabled" : ""}>${label}</button>`;
-      }
+      // Before the draw show demand, after it show seats taken
+      const count = c.drawn ? c.enrolled : c.applicants;
+      const pct = Math.min(100, Math.round((count / c.capacity) * 100));
+      const label = c.drawn ? `${c.enrolled} / ${c.capacity} seats` : `${c.applicants} applied · ${c.capacity} seats`;
       return `
         <div class="course ${mine ? "mine" : ""}">
           <span class="code">${esc(c.code)}</span>
           <span class="title">${esc(c.title)}</span>
           <span class="akts mono">${c.akts} AKTS</span>
           <div class="seats">
-            <span class="mono">${c.enrolled} / ${c.capacity} seats</span>
-            <div class="bar ${full ? "full" : pct >= 75 ? "warn" : ""}"><span style="width:${pct}%"></span></div>
+            <span class="mono">${label}</span>
+            <div class="bar ${count >= c.capacity ? "full" : pct >= 75 ? "warn" : ""}"><span style="width:${pct}%"></span></div>
           </div>
-          <span class="action">${btn}</span>
+          <span class="action">${courseAction(c)}</span>
         </div>`;
     })
     .join("");
@@ -317,51 +389,84 @@ function renderMine() {
   }
   const mine = state.courses.filter((c) => state.myCourses.has(c.id));
   const total = mine.reduce((a, c) => a + c.akts, 0);
-  $("myTotal").textContent = `${total} AKTS used · ${state.balance} left`;
+  $("myTotal").textContent = `${total} AKTS in won seats · ${state.balance} free`;
   box.innerHTML = mine.length
     ? `<ul>${mine.map((c) => `<li><b>${esc(c.code)}</b> ${esc(c.title)} <span class="hint">(${c.akts} AKTS)</span></li>`).join("")}</ul>`
-    : `<p class="empty">No courses selected yet.</p>`;
+    : `<p class="empty">Seats you win appear here after the draw.</p>`;
 }
 
 function tick() {
   const now = Date.now() / 1000;
   const label = $("countdownLabel");
   const cd = $("countdown");
-  if (!state.start) {
-    label.textContent = "Window";
+  const steps = [
+    [state.applyStart, "Applications open in"],
+    [state.applyEnd, "Applications close in"],
+    [state.revealEnd, "Reveal closes in"],
+  ];
+  const next = steps.find(([t]) => now < t);
+  if (!state.applyStart) {
+    label.textContent = "Schedule";
     cd.textContent = "not set";
-  } else if (now < state.start) {
-    label.textContent = "Opens in";
-    cd.textContent = fmtDuration(state.start - now);
-  } else if (now < state.end) {
-    label.textContent = "Closes in";
-    cd.textContent = fmtDuration(state.end - now);
+  } else if (next) {
+    label.textContent = next[1];
+    cd.textContent = fmtDuration(next[0] - now);
   } else {
-    label.textContent = "Closed";
-    cd.textContent = new Date(state.end * 1000).toLocaleString();
+    label.textContent = "Draw open since";
+    cd.textContent = new Date(state.revealEnd * 1000).toLocaleString();
   }
 }
 
 // ---------------------------------------------------------------- actions
 
-async function withPending(id, label, fn) {
+async function withPending(id, fn) {
   state.pending.add(id);
   renderCourses();
-  await send(label, fn);
+  await fn();
   state.pending.delete(id);
   renderCourses();
+}
+
+async function apply(id) {
+  const secret = ethers.hexlify(crypto.getRandomValues(new Uint8Array(32)));
+  saveSecret(id, secret);
+  const ok = confirm(
+    "Your secret was downloaded as a backup file. Keep it: without it you cannot reveal and you lose the seat and the AKTS.\n\nSend the application?"
+  );
+  if (!ok) return;
+  await send(`Apply ${state.courses[id].code}`, () =>
+    state.writeContract.applyFor(id, commitmentOf(id, state.account, secret))
+  );
+}
+
+async function reveal(id) {
+  let secret = loadSecret(id);
+  if (!secret) {
+    secret = prompt("No secret found in this browser. Paste the \"secret\" value from your backup file:")?.trim();
+    if (!secret) return;
+  }
+  if (!ethers.isHexString(secret, 32)) return notify("That is not a valid secret (0x + 64 hex characters).", "err");
+  await send(`Reveal ${state.courses[id].code}`, () => state.writeContract.reveal(id, secret));
+}
+
+async function runDraw(id) {
+  while (!(await state.readContract.drawn(id))) {
+    const ok = await send(`Draw ${state.courses[id].code}`, () => state.writeContract.draw(id, DRAW_BATCH));
+    if (!ok) return;
+  }
 }
 
 $("courseList").addEventListener("click", (e) => {
   const b = e.target.closest("button");
   if (!b || b.disabled) return;
-  if (b.dataset.enroll !== undefined) {
-    const id = Number(b.dataset.enroll);
-    withPending(id, `Enroll ${state.courses[id].code}`, () => state.writeContract.enroll(id));
-  } else if (b.dataset.drop !== undefined) {
-    const id = Number(b.dataset.drop);
-    withPending(id, `Drop ${state.courses[id].code}`, () => state.writeContract.drop(id));
-  }
+  const id = Number(b.dataset.id);
+  const actions = {
+    apply: () => apply(id),
+    reveal: () => reveal(id),
+    draw: () => runDraw(id),
+    refund: () => send(`Refund ${state.courses[id].code}`, () => state.writeContract.claimRefund(id)),
+  };
+  withPending(id, actions[b.dataset.action]);
 });
 
 $("studentsForm").addEventListener("submit", async (e) => {
@@ -393,9 +498,8 @@ $("courseForm").addEventListener("submit", async (e) => {
 
 $("windowForm").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const start = Math.floor(new Date($("wStart").value).getTime() / 1000);
-  const end = Math.floor(new Date($("wEnd").value).getTime() / 1000);
-  await send("Set window", () => state.writeContract.setRegistrationWindow(start, end));
+  const ts = (id) => Math.floor(new Date($(id).value).getTime() / 1000);
+  await send("Set schedule", () => state.writeContract.setSchedule(ts("wStart"), ts("wApplyEnd"), ts("wRevealEnd")));
 });
 
 $("exportBtn").addEventListener("click", async () => {
@@ -423,7 +527,8 @@ $("connectBtn").addEventListener("click", connect);
 
   const now = new Date();
   $("wStart").value = toLocalInput(new Date(now.getTime() + 10 * 60000));
-  $("wEnd").value = toLocalInput(new Date(now.getTime() + 70 * 60000));
+  $("wApplyEnd").value = toLocalInput(new Date(now.getTime() + 15 * 60000));
+  $("wRevealEnd").value = toLocalInput(new Date(now.getTime() + 20 * 60000));
 
   try {
     await refresh();
