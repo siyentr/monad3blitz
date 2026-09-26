@@ -76,14 +76,20 @@ function notify(msg, kind = "ok") {
   }
 }
 
+// Name the offending address when the contract reports one
+function errorText({ name, args }) {
+  if (name === "AlreadyStudent" && args?.[0]) return `${args[0]} is already a student.`;
+  return ERRORS[name] || name;
+}
+
 function decodeError(err) {
   const iface = state.readContract?.interface;
-  if (err?.revert?.name) return ERRORS[err.revert.name] || err.revert.name;
+  if (err?.revert?.name) return errorText(err.revert);
   const data = err?.data || err?.info?.error?.data?.data || err?.info?.error?.data || err?.error?.data;
   if (iface && typeof data === "string" && data.startsWith("0x")) {
     try {
       const parsed = iface.parseError(data);
-      if (parsed) return ERRORS[parsed.name] || parsed.name;
+      if (parsed) return errorText(parsed);
     } catch {}
   }
   if (err?.code === "ACTION_REJECTED") return "Transaction rejected in wallet.";
