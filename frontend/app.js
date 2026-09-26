@@ -188,6 +188,7 @@ function disconnected() {
   state.writeContract = null;
   state.balance = null;
   state.myCourses = new Set();
+  state.my = {};
   $("connectBtn").textContent = "Connect wallet";
   render();
 }
