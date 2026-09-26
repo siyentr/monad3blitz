@@ -502,6 +502,12 @@ $("windowForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const start = Math.floor(new Date($("wStart").value).getTime() / 1000);
   const end = Math.floor(new Date($("wEnd").value).getTime() / 1000);
+  // The contract rejects a start before the current block time; check first so the reason is clear
+  const { timestamp } = await state.readContract.runner.getBlock("latest");
+  if (start < timestamp + 60) {
+    return notify("Opening time must be at least 1 minute in the future. The default times are set when the page loads, so they may be in the past now.", "err");
+  }
+  if (end <= start) return notify("Closing time must be after the opening time.", "err");
   await send("Set window", () => write("setRegistrationWindow", start, end));
 });
 
