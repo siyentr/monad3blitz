@@ -90,6 +90,28 @@ function decodeError(err) {
   return err?.shortMessage || err?.message || String(err);
 }
 
+// Estimate gas over our own RPC and pass it in, so the wallet only has to open its popup.
+// Otherwise ethers asks the wallet's RPC for the estimate first, and MetaMask silently retries
+// that on rate limits, which looks like a popup that never appears. It also surfaces reverts early.
+// Monad charges the full gas limit, so the buffer stays small.
+async function write(method, ...args) {
+  const t0 = performance.now();
+  const gas = await state.readContract[method].estimateGas(...args, { from: state.account });
+  console.debug(`[tx] ${method}: estimated ${gas} gas in ${Math.round(performance.now() - t0)}ms, opening wallet`);
+  const req = await state.writeContract[method].populateTransaction(...args, { gasLimit: (gas * 115n) / 100n });
+  // sendUncheckedTransaction skips ethers' polling of the wallet's RPC for the tx; we wait on our own RPC
+  const hash = await state.writeContract.runner.sendUncheckedTransaction(req);
+  console.debug(`[tx] ${method}: wallet returned ${hash} after ${Math.round(performance.now() - t0)}ms`);
+  return {
+    hash,
+    wait: async () => {
+      const receipt = await state.readContract.runner.waitForTransaction(hash);
+      if (receipt.status !== 1) throw new Error(`Transaction reverted (${hash})`);
+      return receipt;
+    },
+  };
+}
+
 async function send(label, fn) {
   try {
     notify(`${label}: confirm in your wallet…`, "pending");
@@ -402,10 +424,10 @@ $("courseList").addEventListener("click", (e) => {
   if (!b || b.disabled) return;
   if (b.dataset.enroll !== undefined) {
     const id = Number(b.dataset.enroll);
-    withPending(id, () => send(`Enroll ${state.courses[id].code}`, () => state.writeContract.enroll(id)));
+    withPending(id, () => send(`Enroll ${state.courses[id].code}`, () => write("enroll", id)));
   } else if (b.dataset.drop !== undefined) {
     const id = Number(b.dataset.drop);
-    withPending(id, () => send(`Drop ${state.courses[id].code}`, () => state.writeContract.drop(id)));
+    withPending(id, () => send(`Drop ${state.courses[id].code}`, () => write("drop", id)));
   }
 });
 
@@ -419,7 +441,7 @@ $("studentsForm").addEventListener("submit", async (e) => {
   // Chunk to stay well within block gas limits
   for (let i = 0; i < addrs.length; i += 200) {
     const chunk = addrs.slice(i, i + 200);
-    const ok = await send(`Add ${chunk.length} students`, () => state.writeContract.addStudents(chunk));
+    const ok = await send(`Add ${chunk.length} students`, () => write("addStudents", chunk));
     if (!ok) return;
   }
   $("studentsInput").value = "";
@@ -428,7 +450,7 @@ $("studentsForm").addEventListener("submit", async (e) => {
 $("courseForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const ok = await send(`Add ${$("cCode").value}`, () =>
-    state.writeContract.addCourse($("cCode").value.trim(), $("cTitle").value.trim(), Number($("cAkts").value), Number($("cCap").value))
+    write("addCourse", $("cCode").value.trim(), $("cTitle").value.trim(), Number($("cAkts").value), Number($("cCap").value))
   );
   if (ok) {
     $("cCode").value = "";
@@ -440,7 +462,7 @@ $("windowForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const start = Math.floor(new Date($("wStart").value).getTime() / 1000);
   const end = Math.floor(new Date($("wEnd").value).getTime() / 1000);
-  await send("Set window", () => state.writeContract.setRegistrationWindow(start, end));
+  await send("Set window", () => write("setRegistrationWindow", start, end));
 });
 
 $("exportBtn").addEventListener("click", async () => {
