@@ -1,0 +1,33 @@
+{
+  "name": "monad3blitz",
+  "version": "1.0.0",
+  "description": "Fair university course registration with soulbound AKTS credits on Monad",
+  "scripts": {
+    "test": "hardhat test",
+    "compile": "hardhat compile",
+    "chain": "hardhat node",
+    "deploy:local": "hardhat run scripts/deploy.js --network localhost",
+    "seed:local": "hardhat run scripts/seed-local.js --network localhost",
+    "deploy:testnet": "hardhat run scripts/deploy.js --network monadTestnet",
+    "deploy:mainnet": "hardhat run scripts/deploy.js --network monadMainnet",
+    "web": "pnpm dlx serve frontend -l 5173",
+    "verify:testnet": "hardhat verify --network monadTestnet"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/siyentr/monad3blitz.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/siyentr/monad3blitz/issues"
+  },
+  "homepage": "https://github.com/siyentr/monad3blitz#readme",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "ethers": "^6.17.0",
+    "hardhat": "^2.29.1"
+  }
+}

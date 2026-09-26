@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AKTS Course Registration</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
+  <script src="deployment.js"></script>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">◆</span>
+      <div>
+        <h1>AKTS Course Registration</h1>
+        <p class="sub">Fair, first-come-first-served course selection on Monad</p>
+      </div>
+    </div>
+    <button id="connectBtn" class="btn primary">Connect wallet</button>
+  </header>
+
+  <main>
+    <section class="status-bar">
+      <div class="stat">
+        <span class="label">Phase</span>
+        <span id="phaseBadge" class="badge">—</span>
+      </div>
+      <div class="stat">
+        <span class="label" id="countdownLabel">Opens in</span>
+        <span id="countdown" class="mono big">—</span>
+      </div>
+      <div class="stat">
+        <span class="label">Students</span>
+        <span id="studentCount" class="mono big">—</span>
+      </div>
+      <div class="stat">
+        <span class="label">Your AKTS</span>
+        <span id="myAkts" class="mono big">—</span>
+      </div>
+    </section>
+
+    <div id="notice" class="notice hidden"></div>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Courses</h2>
+        <span class="hint" id="liveHint">live · refreshes every second</span>
+      </div>
+      <div id="courseList" class="course-list"><p class="empty">No deployment loaded. Run the deploy script first.</p></div>
+    </section>
+
+    <section class="card" id="myCoursesCard">
+      <div class="card-head"><h2>My courses</h2><span class="hint" id="myTotal"></span></div>
+      <div id="myCourses"><p class="empty">Connect your wallet to see your enrollments.</p></div>
+    </section>
+
+    <section class="card hidden" id="adminCard">
+      <div class="card-head"><h2>Admin</h2><span class="hint" id="adminLock"></span></div>
+
+      <div class="admin-grid">
+        <form id="studentsForm" class="panel">
+          <h3>Add students</h3>
+          <p class="hint">One wallet address per line (or comma separated). Each gets 30 AKTS.</p>
+          <textarea id="studentsInput" rows="6" placeholder="0x...&#10;0x..."></textarea>
+          <button class="btn primary" type="submit">Add students</button>
+        </form>
+
+        <form id="courseForm" class="panel">
+          <h3>Add course</h3>
+          <label>Code <input id="cCode" required placeholder="CENG101" /></label>
+          <label>Title <input id="cTitle" required placeholder="Introduction to Programming" /></label>
+          <div class="row">
+            <label>AKTS <input id="cAkts" type="number" min="1" max="30" required value="6" /></label>
+            <label>Capacity <input id="cCap" type="number" min="1" required value="40" /></label>
+          </div>
+          <button class="btn primary" type="submit">Add course</button>
+        </form>
+
+        <form id="windowForm" class="panel">
+          <h3>Registration window</h3>
+          <p class="hint">After it opens, all admin actions are locked, so nobody can be favoured.</p>
+          <label>Opens <input id="wStart" type="datetime-local" required /></label>
+          <label>Closes <input id="wEnd" type="datetime-local" required /></label>
+          <button class="btn primary" type="submit">Set window</button>
+        </form>
+
+        <div class="panel">
+          <h3>Rosters</h3>
+          <p class="hint">Download the final student list for every course.</p>
+          <button id="exportBtn" class="btn" type="button">Export CSV</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span id="contractInfo"></span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
