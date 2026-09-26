@@ -66,6 +66,7 @@ contract CourseRegistration {
     mapping(uint256 => Entry[]) private _heap;
     mapping(uint256 => uint256) public drawCursor;
     mapping(uint256 => bool) public drawn;
+    mapping(uint256 => mapping(address => bool)) public refunded;
 
     // ---------------------------------------------------------------------
     // Events
@@ -80,6 +81,7 @@ contract CourseRegistration {
     event Applied(uint256 indexed courseId, address indexed student, bytes32 commitment);
     event Revealed(uint256 indexed courseId, address indexed student, bytes32 secret);
     event DrawFinished(uint256 indexed courseId, bytes32 seed, uint32 winners);
+    event Refunded(uint256 indexed courseId, address indexed student, uint256 akts);
 
     // ---------------------------------------------------------------------
     // Errors
@@ -95,6 +97,8 @@ contract CourseRegistration {
     error AlreadyRevealed();
     error WrongSecret();
     error AlreadyDrawn();
+    error NotDrawn();
+    error NotRefundable();
     error InsufficientAKTS(uint256 have, uint256 need);
     error InvalidWindow();
     error InvalidParams();
@@ -300,6 +304,20 @@ contract CourseRegistration {
             c.enrolled = uint32(roster.length);
             emit DrawFinished(courseId, seed, c.enrolled);
         }
+    }
+
+    /// @notice Get the reserved AKTS back after losing the draw. Unrevealed applications are not refunded.
+    function claimRefund(uint256 courseId) external validCourse(courseId) {
+        if (!drawn[courseId]) revert NotDrawn();
+        if (!revealed[courseId][msg.sender] || isEnrolled(courseId, msg.sender) || refunded[courseId][msg.sender]) {
+            revert NotRefundable();
+        }
+        refunded[courseId][msg.sender] = true;
+        uint256 akts = _courses[courseId].akts;
+        balanceOf[msg.sender] += akts;
+        totalSupply += akts;
+        emit Transfer(address(0), msg.sender, akts);
+        emit Refunded(courseId, msg.sender, akts);
     }
 
     function _siftUp(Entry[] storage heap, uint256 i) private {

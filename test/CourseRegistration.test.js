@@ -315,4 +315,46 @@ describe("CourseRegistration", function () {
       expect(await reg.getRoster(0)).to.deep.equal([]);
     });
   });
+
+  describe("Refund", function () {
+    // Course 0: 3 applicants reveal for 2 seats (6 AKTS). Course 1: alice applies but withholds (8 AKTS).
+    async function drawnFixture() {
+      const f = await openFixture();
+      const { reg, alice, bob, carol, apply, applyEnd, revealEnd } = f;
+      for (const s of [alice, bob, carol]) await apply(s, 0);
+      await apply(alice, 1);
+      await time.increaseTo(applyEnd);
+      for (const s of [alice, bob, carol]) await reg.connect(s).reveal(0, secretOf(s.address));
+      await time.increaseTo(revealEnd);
+      return f;
+    }
+
+    it("is not possible before the draw", async function () {
+      const { reg, alice } = await loadFixture(drawnFixture);
+      await expect(reg.connect(alice).claimRefund(0)).to.be.revertedWithCustomError(reg, "NotDrawn");
+    });
+
+    it("returns AKTS once to the loser, never to winners", async function () {
+      const { reg, alice, bob, carol } = await loadFixture(drawnFixture);
+      await reg.draw(0, 1000);
+      const students = [alice, bob, carol];
+      const losers = [];
+      for (const s of students) if (!(await reg.isEnrolled(0, s.address))) losers.push(s);
+      expect(losers).to.have.length(1);
+      const [l] = losers;
+      const before = await reg.balanceOf(l.address);
+      await expect(reg.connect(l).claimRefund(0)).to.emit(reg, "Refunded").withArgs(0, l.address, 6);
+      expect(await reg.balanceOf(l.address)).to.equal(before + 6n);
+      await expect(reg.connect(l).claimRefund(0)).to.be.revertedWithCustomError(reg, "NotRefundable");
+      for (const w of students.filter((s) => s !== l)) {
+        await expect(reg.connect(w).claimRefund(0)).to.be.revertedWithCustomError(reg, "NotRefundable");
+      }
+    });
+
+    it("does not refund an application that was never revealed", async function () {
+      const { reg, alice } = await loadFixture(drawnFixture);
+      await reg.draw(1, 1000);
+      await expect(reg.connect(alice).claimRefund(1)).to.be.revertedWithCustomError(reg, "NotRefundable");
+    });
+  });
 });
