@@ -14,7 +14,7 @@
       <span class="logo">◆</span>
       <div>
         <h1>AKTS Course Registration</h1>
-        <p class="sub">Fair, first-come-first-served course selection on Monad</p>
+        <p class="sub">No race: fair course selection by verifiable lottery on Monad</p>
       </div>
     </div>
     <button id="connectBtn" class="btn primary">Connect wallet</button>
@@ -52,7 +52,7 @@
 
     <section class="card" id="myCoursesCard">
       <div class="card-head"><h2>My courses</h2><span class="hint" id="myTotal"></span></div>
-      <div id="myCourses"><p class="empty">Connect your wallet to see your enrollments.</p></div>
+      <div id="myCourses"><p class="empty">Connect your wallet to see your seats.</p></div>
     </section>
 
     <section class="card hidden" id="adminCard">
@@ -78,11 +78,12 @@
         </form>
 
         <form id="windowForm" class="panel">
-          <h3>Registration window</h3>
-          <p class="hint">After it opens, all admin actions are locked, so nobody can be favoured.</p>
-          <label>Opens <input id="wStart" type="datetime-local" required /></label>
-          <label>Closes <input id="wEnd" type="datetime-local" required /></label>
-          <button class="btn primary" type="submit">Set window</button>
+          <h3>Schedule</h3>
+          <p class="hint">Once applications open, all admin actions are locked, so nobody can be favoured.</p>
+          <label>Applications open <input id="wStart" type="datetime-local" required /></label>
+          <label>Applications close / reveal opens <input id="wApplyEnd" type="datetime-local" required /></label>
+          <label>Reveal closes / draw opens <input id="wRevealEnd" type="datetime-local" required /></label>
+          <button class="btn primary" type="submit">Set schedule</button>
         </form>
 
         <div class="panel">
@@ -96,6 +97,7 @@
 
   <footer>
     <span id="contractInfo"></span>
+    <span class="hint">Verify any draw yourself: <code>pnpm verify:draw &lt;contract&gt; &lt;courseId&gt;</code></span>
   </footer>
 
   <script src="app.js"></script>

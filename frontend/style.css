@@ -154,6 +154,7 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .hidden { display: none !important; }
 
 footer { text-align: center; color: var(--muted); font-size: 12px; padding: 0 16px 32px; word-break: break-all; }
+footer span { display: block; margin-top: 4px; }
 
 @media (max-width: 800px) {
   .status-bar { grid-template-columns: repeat(2, 1fr); }
