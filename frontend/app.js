@@ -39,8 +39,18 @@ const ERRORS = {
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
+// Multicall3 (same address on most EVM chains). The public Monad RPC allows ~15 requests/sec and
+// counts every call in a JSON-RPC batch, so a refresh is sent as one aggregated call instead.
+const MULTICALL = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const MULTICALL_ABI = [
+  "function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[])",
+];
+const POLL_MS = 2000;
+
 const state = {
   readContract: null,
+  multicall: null, // null when the chain has no Multicall3 (e.g. local Hardhat)
+  tab: "admin", // which page an admin who is also a student is looking at
   writeContract: null,
   account: null,
   admin: null,
@@ -50,6 +60,7 @@ const state = {
   courses: [],
   myCourses: new Set(),
   balance: null,
+  isStudent: false,
   pending: new Set(), // course ids with an in-flight tx
 };
 
@@ -82,7 +93,12 @@ function decodeError(err) {
 async function send(label, fn) {
   try {
     notify(`${label}: confirm in your wallet…`, "pending");
-    const tx = await fn();
+    // Wallet popups often open behind the browser (Firefox) or wait for the extension to be opened
+    const nudge = setTimeout(
+      () => notify(`${label}: still waiting for your wallet. If no popup appeared, click the MetaMask icon in your toolbar.`, "pending"),
+      8000
+    );
+    const tx = await fn().finally(() => clearTimeout(nudge));
     notify(`${label}: submitted, waiting for Monad…`, "pending");
     const t0 = performance.now();
     await tx.wait();
@@ -140,7 +156,9 @@ async function useAccount(eth) {
   const signer = await provider.getSigner();
   state.account = (await signer.getAddress()).toLowerCase();
   state.writeContract = new ethers.Contract(D.address, D.abi, signer);
-  $("connectBtn").textContent = `${state.account.slice(0, 6)}…${state.account.slice(-4)}`;
+  state.tab = "admin";
+  $("accountAddr").textContent = `${state.account.slice(0, 6)}…${state.account.slice(-4)}`;
+  $("deniedAddr").textContent = state.account;
   await refresh();
 }
 
@@ -148,6 +166,7 @@ function disconnected() {
   state.account = null;
   state.writeContract = null;
   state.balance = null;
+  state.isStudent = false;
   state.myCourses = new Set();
   $("connectBtn").textContent = "Connect wallet";
   render();
@@ -211,16 +230,34 @@ function watchWallet() {
 
 // ---------------------------------------------------------------- data
 
-async function refresh() {
+// Run several view calls on the registration contract, as [fnName, ...args], in one RPC request
+async function readMany(calls) {
   const c = state.readContract;
-  const [admin, start, end, phase, courses, studentCount] = await Promise.all([
-    c.admin(),
-    c.registrationStart(),
-    c.registrationEnd(),
-    c.phase(),
-    c.getAllCourses(),
-    c.studentCount(),
+  if (!state.multicall) return Promise.all(calls.map(([fn, ...args]) => c[fn](...args)));
+  const iface = c.interface;
+  const res = await state.multicall.aggregate3.staticCall(
+    calls.map(([fn, ...args]) => ({ target: D.address, allowFailure: false, callData: iface.encodeFunctionData(fn, args) }))
+  );
+  return res.map(([, data], i) => {
+    const out = iface.decodeFunctionResult(calls[i][0], data);
+    return out.length === 1 ? out[0] : out;
+  });
+}
+
+async function refresh() {
+  const me = state.account;
+  const accountCalls = me ? [["balanceOf", me], ["getStudentCourses", me], ["isStudent", me]] : [];
+  const [admin, start, end, phase, courses, studentCount, ...acct] = await readMany([
+    ["admin"],
+    ["registrationStart"],
+    ["registrationEnd"],
+    ["phase"],
+    ["getAllCourses"],
+    ["studentCount"],
+    ...accountCalls,
   ]);
+  // The wallet changed while this refresh was in flight; its results belong to the old account
+  if (me !== state.account) return;
   state.admin = admin.toLowerCase();
   state.start = Number(start);
   state.end = Number(end);
@@ -235,12 +272,8 @@ async function refresh() {
   }));
   $("studentCount").textContent = studentCount.toString();
 
-  if (state.account) {
-    const [bal, mine, isStudent] = await Promise.all([
-      c.balanceOf(state.account),
-      c.getStudentCourses(state.account),
-      c.isStudent(state.account),
-    ]);
+  if (me) {
+    const [bal, mine, isStudent] = acct;
     state.balance = Number(bal);
     state.isStudent = isStudent;
     state.myCourses = new Set(mine.map(Number));
@@ -250,7 +283,21 @@ async function refresh() {
 
 // ---------------------------------------------------------------- render
 
+// Which page to show: login, denied (not a student), student or admin
+function currentView() {
+  if (!state.account) return "login";
+  const isAdmin = state.account === state.admin;
+  if (isAdmin && (!state.isStudent || state.tab === "admin")) return "admin";
+  return state.isStudent ? "student" : "denied";
+}
+
 function render() {
+  const view = currentView();
+  document.body.dataset.view = view;
+  const both = state.account && state.account === state.admin && state.isStudent;
+  $("tabs").classList.toggle("hidden", !both);
+  document.querySelectorAll("#tabs .tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === view));
+
   const badge = $("phaseBadge");
   badge.textContent = ["Setup", "Open", "Closed"][state.phase];
   badge.className = `badge ${["setup", "open", "closed"][state.phase]}`;
@@ -260,8 +307,6 @@ function render() {
   renderCourses();
   renderMine();
 
-  const isAdmin = state.account && state.account === state.admin;
-  $("adminCard").classList.toggle("hidden", !isAdmin);
   $("adminLock").textContent = state.phase === 0 ? "setup is open" : "🔒 locked: registration has started";
   document.querySelectorAll("#adminCard form button").forEach((b) => (b.disabled = state.phase !== 0));
 }
@@ -272,7 +317,7 @@ function renderCourses() {
     list.innerHTML = `<p class="empty">No courses yet.</p>`;
     return;
   }
-  const canAct = state.account && state.isStudent && state.phase === 1;
+  const canAct = currentView() === "student" && state.phase === 1;
   list.innerHTML = state.courses
     .map((c) => {
       const pct = Math.round((c.enrolled / c.capacity) * 100);
@@ -344,10 +389,10 @@ function tick() {
 
 // ---------------------------------------------------------------- actions
 
-async function withPending(id, label, fn) {
+async function withPending(id, fn) {
   state.pending.add(id);
   renderCourses();
-  await send(label, fn);
+  await fn();
   state.pending.delete(id);
   renderCourses();
 }
@@ -357,10 +402,10 @@ $("courseList").addEventListener("click", (e) => {
   if (!b || b.disabled) return;
   if (b.dataset.enroll !== undefined) {
     const id = Number(b.dataset.enroll);
-    withPending(id, `Enroll ${state.courses[id].code}`, () => state.writeContract.enroll(id));
+    withPending(id, () => send(`Enroll ${state.courses[id].code}`, () => state.writeContract.enroll(id)));
   } else if (b.dataset.drop !== undefined) {
     const id = Number(b.dataset.drop);
-    withPending(id, `Drop ${state.courses[id].code}`, () => state.writeContract.drop(id));
+    withPending(id, () => send(`Drop ${state.courses[id].code}`, () => state.writeContract.drop(id)));
   }
 });
 
@@ -413,12 +458,44 @@ $("exportBtn").addEventListener("click", async () => {
 
 $("connectBtn").addEventListener("click", connect);
 
+$("tabs").addEventListener("click", (e) => {
+  const t = e.target.closest(".tab");
+  if (!t) return;
+  state.tab = t.dataset.tab;
+  render();
+});
+
+async function logout() {
+  // Drop the site's wallet permission too, otherwise autoConnect logs straight back in on reload
+  try {
+    await getEthereum()?.request({ method: "wallet_revokePermissions", params: [{ eth_accounts: {} }] });
+  } catch {}
+  disconnected();
+}
+
+$("logoutBtn").addEventListener("click", logout);
+
+// Let MetaMask show its account picker again, then re-check the chosen wallet
+$("switchBtn").addEventListener("click", async () => {
+  const eth = getEthereum();
+  try {
+    await eth.request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] });
+    await useAccount(eth);
+  } catch (e) {
+    if (e.code !== 4001) notify(`Could not switch wallet: ${decodeError(e)}`, "err");
+  }
+});
+
 // ---------------------------------------------------------------- boot
 
 (async function boot() {
   if (!D) return;
   const rpc = NETWORKS[D.chainId]?.rpcUrls[0];
-  state.readContract = new ethers.Contract(D.address, D.abi, new ethers.JsonRpcProvider(rpc, D.chainId, { staticNetwork: true }));
+  const provider = new ethers.JsonRpcProvider(rpc, D.chainId, { staticNetwork: true });
+  state.readContract = new ethers.Contract(D.address, D.abi, provider);
+  try {
+    if ((await provider.getCode(MULTICALL)) !== "0x") state.multicall = new ethers.Contract(MULTICALL, MULTICALL_ABI, provider);
+  } catch {}
   $("contractInfo").textContent = `Contract ${D.address} · ${NETWORKS[D.chainId]?.chainName || D.network} (chain ${D.chainId})`;
 
   const now = new Date();
@@ -437,5 +514,12 @@ $("connectBtn").addEventListener("click", connect);
     autoConnect();
   }, 300);
   setInterval(tick, 250);
-  setInterval(() => refresh().catch(() => {}), 1000);
+  // Poll only while logged in, and never start a poll while the previous one is still running
+  let polling = false;
+  setInterval(async () => {
+    if (polling || !state.account) return;
+    polling = true;
+    await refresh().catch(() => {});
+    polling = false;
+  }, POLL_MS);
 })();
