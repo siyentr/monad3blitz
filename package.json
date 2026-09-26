@@ -12,7 +12,8 @@
     "deploy:mainnet": "hardhat run scripts/deploy.js --network monadMainnet",
     "web": "pnpm dlx serve frontend -l 5173",
     "verify:testnet": "hardhat verify --network monadTestnet",
-    "verify:draw": "node scripts/verify-draw.js"
+    "verify:draw": "node scripts/verify-draw.js",
+    "bench:draw": "hardhat run scripts/bench-draw.js"
   },
   "repository": {
     "type": "git",

@@ -54,7 +54,7 @@ contract CourseRegistration {
 
     // courseId => XOR of revealed secrets (order-independent) and the revealed applicants
     mapping(uint256 => bytes32) public seedAcc;
-    mapping(uint256 => address[]) private _pool;
+    mapping(uint256 => address[]) internal _pool;
 
     // Draw state. Each applicant's score is keccak256(seed, student); the `capacity` lowest scores win.
     // A max-heap of the best scores so far lets the draw run in batches over thousands of applicants.
