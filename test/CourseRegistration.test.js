@@ -1,25 +1,11 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { time, loadFixture } = require("@nomicfoundation/hardhat-network-helpers");
+const { expectedWinners } = require("../scripts/lib/draw");
 
 const secretOf = (label) => ethers.id(`secret-${label}`);
 const commitmentOf = (courseId, student, secret) =>
   ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["uint256", "address", "bytes32"], [courseId, student, secret]));
-
-const coder = ethers.AbiCoder.defaultAbiCoder();
-
-// Off-chain recomputation of the draw: the `capacity` lowest keccak256(seed, student) scores win
-function expectedWinners(contractAddress, courseId, secrets, pool, capacity) {
-  const acc = secrets.map(BigInt).reduce((a, b) => a ^ b, 0n);
-  const seed = ethers.keccak256(
-    coder.encode(["bytes32", "uint256", "address"], [ethers.toBeHex(acc, 32), courseId, contractAddress])
-  );
-  return pool
-    .map((student) => ({ student, score: BigInt(ethers.keccak256(coder.encode(["bytes32", "address"], [seed, student]))) }))
-    .sort((a, b) => (a.score < b.score ? -1 : 1))
-    .slice(0, capacity)
-    .map((e) => e.student);
-}
 
 describe("CourseRegistration", function () {
   async function deployFixture() {
