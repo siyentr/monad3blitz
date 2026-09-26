@@ -155,4 +155,53 @@ describe("CourseRegistration", function () {
         .withArgs(2, 6);
     });
   });
+
+  describe("Reveal", function () {
+    async function appliedFixture() {
+      const f = await openFixture();
+      for (const s of [f.alice, f.bob, f.carol]) await f.apply(s, 0);
+      await time.increaseTo(f.applyEnd);
+      return f;
+    }
+    const reveal = (reg, student, courseId, secret = secretOf(student.address)) =>
+      reg.connect(student).reveal(courseId, secret);
+
+    it("is only possible in the reveal window", async function () {
+      const { reg, alice, apply, revealEnd } = await loadFixture(openFixture);
+      await apply(alice, 0);
+      await expect(reveal(reg, alice, 0)).to.be.revertedWithCustomError(reg, "WrongPhase");
+      await time.increaseTo(revealEnd);
+      expect(await reg.phase()).to.equal(3);
+      await expect(reveal(reg, alice, 0)).to.be.revertedWithCustomError(reg, "WrongPhase");
+    });
+
+    it("accepts the right secret and adds the student to the pool", async function () {
+      const { reg, alice } = await loadFixture(appliedFixture);
+      const secret = secretOf(alice.address);
+      await expect(reveal(reg, alice, 0)).to.emit(reg, "Revealed").withArgs(0, alice.address, secret);
+      expect(await reg.revealed(0, alice.address)).to.equal(true);
+      expect(await reg.getPool(0)).to.deep.equal([alice.address]);
+      expect(await reg.seedAcc(0)).to.equal(secret);
+    });
+
+    it("rejects a wrong secret, a double reveal and a student who did not apply", async function () {
+      const { reg, alice, outsider } = await loadFixture(appliedFixture);
+      await expect(reveal(reg, alice, 0, ethers.id("wrong"))).to.be.revertedWithCustomError(reg, "WrongSecret");
+      await reveal(reg, alice, 0);
+      await expect(reveal(reg, alice, 0)).to.be.revertedWithCustomError(reg, "AlreadyRevealed");
+      await expect(reveal(reg, outsider, 0)).to.be.revertedWithCustomError(reg, "NotApplied");
+    });
+
+    it("cannot reuse someone else's secret: commitments are bound to the sender", async function () {
+      const { reg, alice, bob } = await loadFixture(appliedFixture);
+      await expect(reveal(reg, bob, 0, secretOf(alice.address))).to.be.revertedWithCustomError(reg, "WrongSecret");
+    });
+
+    it("seed does not depend on reveal order", async function () {
+      const { reg, alice, bob, carol } = await loadFixture(appliedFixture);
+      for (const s of [carol, alice, bob]) await reveal(reg, s, 0);
+      const expected = [alice, bob, carol].map((s) => BigInt(secretOf(s.address))).reduce((a, b) => a ^ b);
+      expect(BigInt(await reg.seedAcc(0))).to.equal(expected);
+    });
+  });
 });

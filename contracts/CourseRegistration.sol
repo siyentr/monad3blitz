@@ -50,6 +50,11 @@ contract CourseRegistration {
 
     // courseId => student => keccak256(abi.encode(courseId, student, secret))
     mapping(uint256 => mapping(address => bytes32)) public commitments;
+    mapping(uint256 => mapping(address => bool)) public revealed;
+
+    // courseId => XOR of revealed secrets (order-independent) and the revealed applicants
+    mapping(uint256 => bytes32) public seedAcc;
+    mapping(uint256 => address[]) private _pool;
 
     // ---------------------------------------------------------------------
     // Events
@@ -62,6 +67,7 @@ contract CourseRegistration {
     event CourseUpdated(uint256 indexed courseId, uint8 akts, uint32 capacity);
     event ScheduleSet(uint64 applyStart, uint64 applyEnd, uint64 revealEnd);
     event Applied(uint256 indexed courseId, address indexed student, bytes32 commitment);
+    event Revealed(uint256 indexed courseId, address indexed student, bytes32 secret);
 
     // ---------------------------------------------------------------------
     // Errors
@@ -73,6 +79,9 @@ contract CourseRegistration {
     error AlreadyStudent(address student);
     error InvalidCourse();
     error AlreadyApplied();
+    error NotApplied();
+    error AlreadyRevealed();
+    error WrongSecret();
     error InsufficientAKTS(uint256 have, uint256 need);
     error InvalidWindow();
     error InvalidParams();
@@ -91,6 +100,11 @@ contract CourseRegistration {
 
     modifier applyOpen() {
         if (applyStart == 0 || block.timestamp < applyStart || block.timestamp >= applyEnd) revert WrongPhase();
+        _;
+    }
+
+    modifier revealOpen() {
+        if (applyStart == 0 || block.timestamp < applyEnd || block.timestamp >= revealEnd) revert WrongPhase();
         _;
     }
 
@@ -202,6 +216,21 @@ contract CourseRegistration {
         emit Applied(courseId, msg.sender, commitment);
     }
 
+    /// @notice Reveal the secret behind an application. Only revealed applicants enter the draw;
+    ///         an unrevealed application is void and its AKTS are not refunded.
+    function reveal(uint256 courseId, bytes32 secret) external revealOpen validCourse(courseId) {
+        bytes32 commitment = commitments[courseId][msg.sender];
+        if (commitment == bytes32(0)) revert NotApplied();
+        if (revealed[courseId][msg.sender]) revert AlreadyRevealed();
+        if (keccak256(abi.encode(courseId, msg.sender, secret)) != commitment) revert WrongSecret();
+
+        revealed[courseId][msg.sender] = true;
+        seedAcc[courseId] ^= secret;
+        _pool[courseId].push(msg.sender);
+
+        emit Revealed(courseId, msg.sender, secret);
+    }
+
     // =====================================================================
     // AKTS is soulbound: transfers and approvals are disabled
     // =====================================================================
@@ -240,6 +269,11 @@ contract CourseRegistration {
 
     function getRoster(uint256 courseId) external view validCourse(courseId) returns (address[] memory) {
         return _roster[courseId];
+    }
+
+    /// @notice Applicants who revealed, in reveal order (order does not affect the draw).
+    function getPool(uint256 courseId) external view validCourse(courseId) returns (address[] memory) {
+        return _pool[courseId];
     }
 
     function isEnrolled(uint256 courseId, address student) public view returns (bool) {
